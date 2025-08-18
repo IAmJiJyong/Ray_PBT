@@ -9,7 +9,7 @@ from torch import nn, optim
 from torch.utils.data import DataLoader
 from torchvision import models, transforms
 
-from src.config import DATASET_PATH, MAX_GENERATION
+from src.config import DATASET_PATH
 from src.trial_state import TrialState
 from src.tuner import Tuner
 from src.utils import Checkpoint, Hyperparameter, get_head_node_address, unzip_file
@@ -108,8 +108,7 @@ def resnet18_init_fn(
     checkpoint: Checkpoint,
     device: torch.device,
 ) -> tuple[nn.Module, optim.Optimizer]:
-    model = models.resnet18()
-    model.fc = nn.Linear(model.fc.in_features, 10)
+    model = models.resnet18(num_classes=10)
 
     if checkpoint.is_empty():
         model.to(device)

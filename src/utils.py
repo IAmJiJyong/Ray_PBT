@@ -31,8 +31,6 @@ class TrialStatus(Enum):
     RUNNING = auto()
     PENDING = auto()
     TERMINATED = auto()
-    PAUSE = auto()
-    NEED_MUTATION = auto()
     FAILED = auto()
     WAITING = auto()
 
@@ -56,30 +54,23 @@ class DatasetType(Enum):
 # ╰──────────────────────────────────────────────────────────╯
 
 
-@dataclass
+@dataclass(slots=True)
 class WorkerState:
     id: int
     num_cpus: int
     num_gpus: int
     node_name: str
-    max_trials: int = 1
-    worker_type: WorkerType = WorkerType.CPU
 
-    total_train_time: float = 0.0
-    train_step_count: int = 0
+    max_cpu_tasks: int = 0
+    max_gpu_tasks: int = 0
 
-    @property
-    def avg_train_time(self) -> float:
-        if self.train_step_count == 0:
-            return 0.0
-        return self.total_train_time / self.train_step_count
-
-    def record_train_time(self, duration: float) -> None:
-        self.total_train_time += duration
-        self.train_step_count += 1
+    def __post_init__(self) -> None:
+        self.max_cpu_tasks = max(self.num_cpus // 4, 1)
+        if self.num_gpus:
+            self.max_gpu_tasks = self.num_gpus * 3
 
 
-@dataclass
+@dataclass(slots=True)
 class Hyperparameter:
     lr: float
     momentum: float
@@ -110,7 +101,7 @@ class Hyperparameter:
         )
 
 
-@dataclass
+@dataclass(slots=True)
 class Checkpoint:
     model_state_dict: dict
     optimizer_state_dict: dict
@@ -123,7 +114,7 @@ class Checkpoint:
         return not self.model_state_dict and not self.optimizer_state_dict
 
 
-@dataclass
+@dataclass(slots=True)
 class CheckpointLocation:
     worker_id: int | None
     worker_reference: ActorHandle | None

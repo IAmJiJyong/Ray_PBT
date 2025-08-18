@@ -8,11 +8,17 @@ from pathlib import Path
 import ray
 
 from .config import (
-    ITERATION_PER_GENERATION,
     TRIAL_PROGRESS_OUTPUT_PATH,
 )
-from .trial_state import TrialState
+from .trial_state import PartialTrialState, TrialState
 from .utils import TrialStatus, WorkerType, colored_progress_bar
+
+ALLOWED_TRANSITION: dict[TrialStatus, set[TrialStatus]] = {
+    TrialStatus.PENDING: {TrialStatus.WAITING},
+    TrialStatus.WAITING: {TrialStatus.RUNNING},
+    TrialStatus.RUNNING: {TrialStatus.PENDING, TrialStatus.TERMINATED},
+    TrialStatus.TERMINATED: set(),
+}
 
 
 def get_trial_manager_logger() -> logging.Logger:
@@ -56,42 +62,58 @@ class TrialManager:
         self._upper_quantile_trials: list[TrialState] = []
         self.logger = get_trial_manager_logger()
 
-    def add_trial(self, trial_state: TrialState) -> None:
-        self.all_trials[trial_state.id] = trial_state
-
-    def transition_to_waiting(self, trial_id: int) -> None:
-        trial = self.all_trials.get(trial_id, None)
+    def _get_trial_or_raise(self, trial_id: int) -> TrialState:
+        trial = self.all_trials.get(trial_id)
         if trial is None:
-            msg = f"Trial id {trial_id} not found"
+            msg = f"Trial {trial_id} not found"
+            raise ValueError(msg)
+        return trial
+
+    def set_status(self, trial_id: int, new_status: TrialStatus) -> None:
+        trial_state = self._get_trial_or_raise(trial_id)
+        old_status = self.all_trials[trial_id].status
+
+        allowed = ALLOWED_TRANSITION[old_status]
+        if new_status not in allowed:
+            msg = f"Trial {trial_id} 錯誤的狀態轉移: {old_status} -> {new_status}(僅允許: {allowed})"
             raise ValueError(msg)
 
+        trial_state.status = new_status
+        self.logger.info("Trial %d 狀態從 %s -> %s", trial_id, old_status, new_status)
+
+    def acquire_pending_trials(self, worker_id: int, n: int) -> list[TrialState]:
+        self.logger.info("Acquire trials n: %d", n)
+        acquired = []
+
+        for trial_id in list(self.pending_ids)[:n]:
+            trial = self.all_trials[trial_id]
+            trial.worker_id = worker_id
+            acquired.append(trial)
+
+            self.transition_to_waiting(trial_id)
+
+        return acquired
+
+    def transition_to_waiting(self, trial_id: int) -> None:
+        self.set_status(trial_id, TrialStatus.WAITING)
         self.pending_ids.discard(trial_id)
         self.waiting_ids.add(trial_id)
 
-    def transition_to_running(self, trial_id: int) -> None:
-        trial = self.all_trials.get(trial_id, None)
-        if trial is None:
-            msg = f"Trial id {trial_id} not found"
-            raise ValueError(msg)
-
+    def transition_to_running(self, trial_id: int, partial: PartialTrialState) -> None:
+        if partial:
+            self.all_trials[trial_id].update_from_partial(partial)
+        self.set_status(trial_id, TrialStatus.RUNNING)
         self.waiting_ids.discard(trial_id)
         self.running_ids.add(trial_id)
 
     def transition_to_pending(self, trial_id: int) -> None:
-        trial = self.all_trials.get(trial_id, None)
-        if trial is None:
-            msg = f"Trial id {trial_id} not found"
-            raise ValueError(msg)
-
+        self.reset_worker_info(trial_id)
+        self.set_status(trial_id, TrialStatus.PENDING)
         self.running_ids.discard(trial_id)
         self.pending_ids.add(trial_id)
 
     def transition_to_completed(self, trial_id: int) -> None:
-        trial = self.all_trials.get(trial_id, None)
-        if trial is None:
-            msg = f"Trial id {trial_id} not found"
-            raise ValueError(msg)
-
+        self.set_status(trial_id, TrialStatus.TERMINATED)
         self.running_ids.discard(trial_id)
         self.completed_ids.add(trial_id)
 
@@ -189,37 +211,34 @@ class TrialManager:
     def has_pending_trials(self) -> bool:
         return bool(self.pending_ids)
 
+    def reset_worker_info(self, trial_id: int) -> None:
+        self.all_trials[trial_id].worker_id = -1
+        self.all_trials[trial_id].worker_type = None
+        self.all_trials[trial_id].num_cores = 0
+
     def maybe_update_mutation_baseline(self) -> None:
         self._mutation_baseline = self.get_mutation_baseline()
         self._upper_quantile_trials = self.get_upper_quantile_trials()
 
-    def update_trial(self, trial_state: TrialState) -> None:
-        if trial_state.id not in self.all_trials:
-            msg = f"Trial id {trial_state.id} not found"
-            raise ValueError(msg)
+    def update_trial(self, trial_id: int, partial: PartialTrialState) -> None:
+        trial_state = self._get_trial_or_raise(trial_id)
+        trial_state.update_from_partial(partial)
 
-        if (
-            trial_state.status == TrialStatus.RUNNING
-            and trial_state.id in self.waiting_ids
-        ):
-            self.transition_to_running(trial_state.id)
+        if "accuracy" in partial:
+            if trial_state.accuracy > 0 and (
+                self.history_best is None
+                or trial_state.accuracy > self.history_best.accuracy
+            ):
+                self.history_best = trial_state
 
-        self.all_trials[trial_state.id] = trial_state
-
-        if trial_state.accuracy > 0 and (
-            self.history_best is None
-            or trial_state.accuracy > self.history_best.accuracy
-        ):
-            self.history_best = trial_state
-
-        if self.history_best:
-            self.logger.info(
-                "History best accuracy: %.2f, %s, iteration: %d",
-                self.history_best.accuracy,
-                str(self.history_best.hyperparameter),
-                self.history_best.generation,
-            )
-        self.maybe_update_mutation_baseline()
+            if self.history_best:
+                self.logger.info(
+                    "History best accuracy: %.2f, %s, iteration: %d",
+                    self.history_best.accuracy,
+                    str(self.history_best.hyperparameter),
+                    self.history_best.generation,
+                )
+            self.maybe_update_mutation_baseline()
         self.display_trial_result()
 
     def is_finish(self) -> bool:
@@ -245,29 +264,13 @@ class TrialManager:
         with Path(log_dir).open("r") as f:
             return f.read()
 
-    def mutation(self, trial_state: TrialState) -> TrialState:
-        self.logger.info(
-            "Trial %d: 執行mutation, 原始超參數: %s",
-            trial_state.id,
-            trial_state.hyperparameter,
-        )
-
+    def mutation(self) -> PartialTrialState:
         upper_quantile = self.get_cached_upper_quantile_trials()
 
         chose_trial = random.choice(upper_quantile)
         hyperparameter = chose_trial.hyperparameter.explore()
 
-        trial_state.hyperparameter = hyperparameter
-        trial_state.checkpoint = chose_trial.checkpoint
-
-        self.logger.info(
-            "Trial-%d Iter-%d, 結束mutation, 新超參數: %s",
-            trial_state.id,
-            trial_state.generation,
-            trial_state.hyperparameter,
-        )
-
-        return trial_state
+        return {"hyperparameter": hyperparameter, "checkpoint": chose_trial.checkpoint}
 
     def display_trial_result(
         self,
@@ -286,9 +289,9 @@ class TrialManager:
                 for i in self.all_trials.values():
                     match i.worker_type:
                         case WorkerType.CPU:
-                            worker_type = "CPU"
+                            worker_type = f"CPU:{i.num_cores}"
                         case WorkerType.GPU:
-                            worker_type = "GPU"
+                            worker_type = f"GPU:{i.num_cores}"
                         case _:
                             worker_type = ""
 

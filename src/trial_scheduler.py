@@ -2,6 +2,7 @@ import logging
 import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from threading import Event
 from typing import TYPE_CHECKING
 
 import ray
@@ -18,6 +19,7 @@ if TYPE_CHECKING:
 def gpu_scheduling(
     trial_manager: ActorHandle,
     worker_manager: WorkerManager,
+    worker_id: int,
     logger: logging.Logger,
 ) -> None:
     # 若沒有任何 pending 的 Trial,結束
@@ -25,17 +27,7 @@ def gpu_scheduling(
         logger.info("沒有待分配的 Trial")
         return
 
-    available_worker_entries = worker_manager.get_avaiable_gpu_workers()
-
-    if not available_worker_entries:
-        logger.info("沒有可用的 GPU worker")
-        return
-
-    # 選擇擁有最多 slot 的 GPU worker 作為目標 worker
-    selected_worker_entry = max(
-        available_worker_entries,
-        key=lambda e: e.available_slots,
-    )
+    selected_worker_entry = worker_manager.workers[worker_id]
 
     # 取得 iteration 次數最少的一組 pending trials
     trial_states: list[TrialState] = ray.get(
@@ -57,14 +49,15 @@ def gpu_scheduling(
     selected_trial.set_chunk_size(
         ray.get(trial_manager.get_chunk_size.remote(selected_trial.generation)),  # type: ignore[reportGeneralTypeIssues]
     )
-    selected_trial.worker_id = selected_worker_entry.id
-    selected_trial.worker_type = WorkerType.GPU
-    selected_trial.set_waiting()
 
     trial_manager.transition_to_waiting.remote(selected_trial.id)
-    trial_manager.update_trial.remote(selected_trial)
+    trial_manager.update_trial.remote(
+        selected_trial.id,
+        {"worker_id": selected_worker_entry.id, "worker_type": WorkerType.GPU},
+    )
 
     worker_manager.assign_trial_to_worker(
+        WorkerType.GPU,
         selected_worker_entry.id,
         selected_trial,
     )
@@ -73,6 +66,7 @@ def gpu_scheduling(
 def cpu_scheduling(
     trial_manager: ActorHandle,
     worker_manager: WorkerManager,
+    worker_id: int,
     logger: logging.Logger,
 ) -> None:
     # 若沒有任何 pending 的 Trial,結束
@@ -80,17 +74,11 @@ def cpu_scheduling(
         logger.info("沒有待分配的 Trial")
         return
 
-    available_worker_entries = worker_manager.get_avaiable_cpu_workers()
-
-    if not available_worker_entries:
-        logger.info("沒有可用的 CPU worker")
-        return
-
     # 選擇第一個可用的 worker
-    selected_worker_entry = available_worker_entries[0]
+    selected_worker_entry = worker_manager.workers[worker_id]
     selected_trial = ray.get(
         trial_manager.get_nlargest_iteration_trials.remote(  # type: ignore[reportGeneralTypeIssues]
-            len(worker_manager.cpu_workers),
+            len(worker_manager.workers),
         ),
     )
 
@@ -102,13 +90,15 @@ def cpu_scheduling(
     selected_trial.set_chunk_size(2)
     selected_trial.worker_id = selected_worker_entry.id
     selected_trial.worker_type = WorkerType.CPU
-    selected_trial.set_waiting()
 
     # 更新 Trial 狀態至 running
     trial_manager.transition_to_waiting.remote(selected_trial.id)
-    trial_manager.update_trial.remote(selected_trial)
+    trial_manager.update_trial.remote(
+        {"worker_id": worker_id, "worker_type": WorkerType.CPU},
+    )
 
     worker_manager.assign_trial_to_worker(
+        WorkerType.CPU,
         selected_worker_entry.id,
         selected_trial,
     )
@@ -157,7 +147,7 @@ def get_trial_scheduler_logger() -> logging.Logger:
         )
 
         stream_handler = logging.StreamHandler()
-        stream_handler.setLevel(logging.INFO)  # 只顯示 INFO 級別以上的訊息
+        stream_handler.setLevel(logging.DEBUG)  # 只顯示 INFO 級別以上的訊息
         stream_handler.setFormatter(formatter)
         logger.addHandler(stream_handler)
 
@@ -202,27 +192,54 @@ class TrialScheduler:
 
         self._previous_time: float = time.time()
         self.logger.info("初始化完成")
+        self.finish_event = Event()
 
-    def assign_trial_to_worker(self) -> None:  # type: ignore[reportGeneralTypeIssues]
-        """
-        將一個試驗分配給一個可用的工作者。
-
-        如果所有工作者都忙碌, 則返回當前正在運行的訓練任務。
-
-        Returns:
-            List[ObjectRef]: 當前正在運行的訓練任務列表。
-        """
-
-        if (
-            ray.get(
-                self.trial_manager.get_uncompleted_trial_num.remote(),  # type: ignore[reportGeneralTypeIssues]
+    def init_workers(self) -> None:
+        for worker_entry in self.worker_manager.workers.values():
+            num_cpus, num_gpus = (
+                worker_entry.state.max_cpu_tasks,
+                worker_entry.state.max_gpu_tasks,
             )
-            <= len(self.worker_manager.gpu_workers) * 3
-        ):
-            stealing_strategy(self.worker_manager, self.logger)
-        else:
-            cpu_scheduling(self.trial_manager, self.worker_manager, self.logger)
-        gpu_scheduling(self.trial_manager, self.worker_manager, self.logger)
+
+            self.logger.info(
+                "Worker %d, num_cpus: %d num_gpus: %d",
+                worker_entry.id,
+                num_cpus,
+                num_gpus,
+            )
+
+            trials: list[TrialState] = ray.get(
+                self.trial_manager.acquire_pending_trials.remote(
+                    worker_id=worker_entry.id,
+                    n=num_cpus + num_gpus,
+                ),  # type: ignore[reportGeneralTypeIssues]
+            )
+
+            worker_entry.active_trials.extend([t.id for t in trials])
+
+            worker_entry.ref.initial_worker_queue.remote(
+                trials[:num_cpus],
+                trials[num_cpus:] if num_gpus > 0 else None,
+            )
+
+        self.trial_manager.display_trial_result.remote()
+
+    def assign_trial(self, worker_id: int, worker_type: WorkerType) -> None:
+        match worker_type:
+            case WorkerType.CPU:
+                cpu_scheduling(
+                    self.trial_manager,
+                    self.worker_manager,
+                    worker_id,
+                    self.logger,
+                )
+            case WorkerType.GPU:
+                cpu_scheduling(
+                    self.trial_manager,
+                    self.worker_manager,
+                    worker_id,
+                    self.logger,
+                )
 
     def run(self) -> None:
         """
@@ -231,16 +248,8 @@ class TrialScheduler:
         該方法會持續運行直到所有的試驗都完成。
         """
         self.logger.info("訓練開始")
-        update_assign_time = time.time()
-        is_finish = False
-
-        while not is_finish:
-            iterval_time = 1.0
-            if (current_time := time.time()) - update_assign_time > iterval_time:
-                update_assign_time = current_time
-                self.assign_trial_to_worker()
-
-            is_finish = ray.get(self.trial_manager.is_finish.remote())  # type: ignore[reportGeneralTypeIssues]
+        self.init_workers()
+        self.finish_event.wait()
 
         self.trial_manager.print_iteration_count.remote()
         self.logger.info("🎉 所有 Trial 訓練完成!")

@@ -1,11 +1,15 @@
+import heapq
 import logging
 import random
+from collections.abc import Callable
+from itertools import count
 from pathlib import Path
 
 import ray
 import torch
 from ray.actor import ActorHandle
 from torch import nn, optim
+from torch.types import Device
 from torch.utils.data import DataLoader
 
 from .config import (
@@ -41,11 +45,17 @@ class WorkerLoggerFormatter(logging.Formatter):
             str: 格式化後的日誌訊息。
         """
 
+        worker_type = getattr(record, "worker_type", WorkerType.CPU)
+        if worker_type == WorkerType.GPU:
+            record.worker_type = "GPU"
+        elif worker_type == WorkerType.CPU:
+            record.worker_type = "CPU"
+
         record.trial_id = getattr(record, "trial_id", "N/A")
         return super().format(record)
 
 
-def get_worker_logger(worker_id: int, worker_type: WorkerType) -> logging.Logger:
+def get_worker_logger(worker_id: int) -> logging.Logger:
     """
     建立並回傳指定 worker_id 的 logger, 支援終端輸出與檔案寫入。
 
@@ -64,14 +74,8 @@ def get_worker_logger(worker_id: int, worker_type: WorkerType) -> logging.Logger
     if not logger.handlers:
         logger.setLevel(logging.DEBUG)
 
-        match worker_type:
-            case WorkerType.GPU:
-                worker_type_str = "GPU"
-            case WorkerType.CPU:
-                worker_type_str = "CPU"
-
         formatter = WorkerLoggerFormatter(
-            f"[%(asctime)s] %(levelname)s {worker_type_str} "
+            f"[%(asctime)s] %(levelname)s %(worker_type)s "
             f"WORKER_ID: {worker_id} TRIAL_ID: %(trial_id)s -- %(message)s",
         )
 
@@ -88,19 +92,166 @@ def get_worker_logger(worker_id: int, worker_type: WorkerType) -> logging.Logger
     return logger
 
 
+class WorkerResource:
+    def __init__(self, max_cpus: int, max_gpus: int) -> None:
+        self.max_cpus: int = max_cpus
+        self.max_gpus: int = max_gpus
+        self.available_cpus: int = self.max_cpus
+        self.available_gpus: int = self.max_gpus
+
+    def decide_cpu_allocation(self, trial_state: TrialState) -> int:
+        progress = trial_state.generation / trial_state.max_generation
+        early_phase = 0.3
+        middle_phase = 0.7
+        if progress <= early_phase:
+            return min(4, self.max_cpus)
+
+        if progress <= middle_phase:
+            return min(8, self.max_cpus)
+        return self.max_cpus
+
+    def request_cpu(self, num_cpus: int) -> bool:
+        if self.available_cpus <= 0 or self.available_cpus < num_cpus:
+            return False
+        self.available_cpus -= num_cpus
+        return True
+
+    def release_cpu(self, num_cpus: int) -> None:
+        self.available_cpus += num_cpus
+
+    def request_gpu(self, num_gpus: int = 1) -> bool:
+        if self.available_gpus <= 0 or self.available_gpus < num_gpus:
+            return False
+        self.available_gpus -= num_gpus
+        return True
+
+    def release_gpu(self, num_gpus: int = 1) -> None:
+        self.available_gpus += num_gpus
+
+
+@ray.remote
+def run_task(  # noqa: PLR0913
+    trial_state: TrialState,
+    worker_type: WorkerType,
+    num_cores: int,
+    train_step: Callable,
+    dataloader_factory: DataloaderFactory,
+    trial_manager: ActorHandle,
+    worker: ActorHandle,
+) -> None:
+    torch.set_num_threads(num_cores)
+
+    hyperparameter = trial_state.hyperparameter
+    train_loader, test_loader, _ = dataloader_factory(
+        hyperparameter.batch_size,
+        num_workers=0,
+    )
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model, optimizer = trial_state.model_init_fn(device)
+
+    trial_manager.transition_to_running.remote(
+        trial_state.id,
+        {"worker_type": worker_type, "num_cores": num_cores},
+    )
+
+    train(
+        trial_state,
+        num_cores,
+        train_step,
+        device,
+        worker_type,
+        model,
+        optimizer,
+        train_loader,
+        test_loader,
+        trial_manager,
+        worker,
+    )
+
+
+def train(  # noqa: PLR0913
+    trial_state: TrialState,
+    num_cores: int,
+    train_step: Callable,
+    device: Device,
+    worker_type: WorkerType,
+    model: nn.Module,
+    optimizer: optim.Optimizer,
+    train_loader: DataLoader,
+    test_loader: DataLoader,
+    trial_manager: ActorHandle,
+    worker: ActorHandle,
+) -> None:
+    for _ in range(trial_state.chunk_size):
+        for _ in range(ITERATION_PER_GENERATION):
+            if trial_state.generation >= trial_state.max_generation:
+                break
+
+            train_step(
+                model,
+                optimizer,
+                train_loader,
+                trial_state.hyperparameter.batch_size,
+                device,
+            )
+
+            trial_state.device_iteration_count[worker_type] += 1
+
+        trial_state.generation += 1
+        trial_state.accuracy = test(device, model, test_loader)
+
+        trial_manager.update_trial.remote(
+            trial_state.id,
+            {
+                "accuracy": trial_state.accuracy,
+                "generation": trial_state.generation,
+            },
+        )
+
+        if (
+            trial_state.generation >= trial_state.max_generation
+            or trial_state.accuracy >= trial_state.stop_accuracy
+        ):
+            trial_state.update_checkpoint(model, optimizer)
+            worker.on_task_complete.remote(
+                trial_state,
+                worker_type,
+                num_cores,
+            )
+            return
+
+        baseline = ray.get(trial_manager.get_mutation_baseline.remote())  # type: ignore[reportGeneralTypeIssues]
+        mutation_ratio = 0.25
+
+        if trial_state.accuracy <= baseline and random.random() >= mutation_ratio:
+            trial_state.update_checkpoint(model, optimizer)
+            worker.on_task_need_mutation.remote(trial_state, worker_type, num_cores)
+            return
+
+    trial_state.update_checkpoint(model, optimizer)
+    worker.on_task_step_complete.remote(trial_state, worker_type, num_cores)
+
+
+def test(device: Device, model: nn.Module, test_loader: DataLoader) -> float:
+    model.eval()
+    total = 0
+    correct = 0
+    with torch.no_grad():
+        for raw_inputs, raw_targets in test_loader:
+            inputs, targets = (
+                raw_inputs.to(device),
+                raw_targets.to(device),
+            )
+            outputs = model(inputs)
+            _, predicted = outputs.max(1)
+            total += targets.size(0)
+            correct += predicted.eq(targets).sum().item()
+
+    return correct / total
+
+
 @ray.remote
 class Worker:
-    """
-    表示一個 worker 節點, 負責訓練與回報試驗結果。
-
-    Attributes:
-        worker_state (WorkerState): Worker 的狀態資訊。
-        active_trials (dict): 活躍試驗的字典。
-        train_step (TrainStepFunction): 執行訓練步驟的函式。
-        device (torch.device): 使用的設備 (CPU 或 GPU) 。
-        logger (logging.Logger): 負責日誌紀錄。
-    """
-
     def __init__(
         self,
         worker_state: WorkerState,
@@ -109,42 +260,27 @@ class Worker:
         trial_manager: ActorHandle,
         dataloader_factory: DataloaderFactory,
     ) -> None:
-        """
-        初始化 Worker, 設定狀態與參數。
-
-        Args:
-            worker_state (WorkerState): Worker 的狀態資訊。
-            train_step (TrainStepFunction): 訓練步驟函式。
-            tuner (ActorHandle): 負責接收訓練結果的 Actor。
-        """
         self.worker_state: WorkerState = worker_state
-        self.active_trials: dict[int, TrialState] = {}
         self.train_step: TrainStepFunction = train_step
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.logger = get_worker_logger(
-            worker_id=worker_state.id,
-            worker_type=worker_state.worker_type,
-        )
         self.tuner: ActorHandle = tuner
         self.trial_manager: ActorHandle = trial_manager
-        self.iteration_per_generation: int = ITERATION_PER_GENERATION
-        self.interrupt_set: set = set()
         self.dataloader_factory: DataloaderFactory = dataloader_factory
-        self.is_stop: bool = False
+
+        self.interrupt_set: set = set()
+        self.iteration_per_generation: int = ITERATION_PER_GENERATION
+        self.logger: logging.Logger = get_worker_logger(
+            worker_id=worker_state.id,
+        )
         self.saved_checkpoint: dict[int, Checkpoint] = {}
         self.logger.info("初始化完成")
-
-    def stealing_trial(self, trial_id: int) -> None:
-        trial_state = self.active_trials.pop(trial_id, None)
-
-        if trial_state is None:
-            self.log("info", "嘗試偷取的 Trial 不存在", trial_id=trial_id)
-            return
-
-        self.interrupt_set.add(trial_id)
-        trial_state.set_pause()
-
-        self.tuner.on_trial_step_complete.remote(self.worker_state.id, trial_state)
+        self.is_stop: bool = False
+        self.cpu_task_queue: list[tuple[int, int, TrialState]] = []
+        self.gpu_task_queue: list[tuple[int, int, TrialState]] = []
+        self._task_counter: count = count()
+        self.worker_resource: WorkerResource = WorkerResource(
+            self.worker_state.num_cpus,
+            self.worker_state.num_gpus,
+        )
 
     def save_checkpoint(self, trial_state: TrialState) -> None:
         self.log("info", "儲存 Checkpoint", trial_id=trial_state.id)
@@ -187,12 +323,89 @@ class Worker:
         else:
             self.log("warning", f"Trial {trial_id} 的檢查點不存在", trial_id=trial_id)
 
-    def send_signal(self, trial_id: int) -> None:
-        if trial_id not in self.active_trials:
-            self.log("info", f"TRIAL_ID: {trial_id}不存在, {self.active_trials.keys()}")
-            return
-        self.log("info", f"接收到訊號 trial: {trial_id}")
-        self.interrupt_set.add(trial_id)
+    def on_task_complete(
+        self,
+        trial_state: TrialState,
+        worker_type: WorkerType,
+        num_cores: int,
+    ) -> None:
+        self.log(
+            "info",
+            "Trial 訓練完成",
+            worker_type=worker_type,
+            trial_id=trial_state.id,
+        )
+        self.tuner.on_trial_complete.remote(
+            self.worker_state.id,
+            trial_state.id,
+            {
+                "accuracy": trial_state.accuracy,
+                "checkpoint": trial_state.checkpoint,
+                "generation": trial_state.generation,
+            },
+        )
+
+        match worker_type:
+            case WorkerType.CPU:
+                self.worker_resource.release_cpu(num_cores)
+                self.dispatch_cpu_task()
+            case WorkerType.GPU:
+                self.worker_resource.release_gpu(num_cores)
+                self.dispatch_gpu_task()
+
+    def on_task_need_mutation(
+        self,
+        trial_state: TrialState,
+        worker_type: WorkerType,
+        num_cores: int,
+    ) -> None:
+        self.tuner.on_trial_need_mutation.remote(
+            self.worker_state.id,
+            trial_state.id,
+            {
+                "accuracy": trial_state.accuracy,
+                "checkpoint": trial_state.checkpoint,
+                "generation": trial_state.generation,
+            },
+        )
+
+        match worker_type:
+            case WorkerType.CPU:
+                self.worker_resource.release_cpu(num_cores)
+                self.dispatch_cpu_task()
+            case WorkerType.GPU:
+                self.worker_resource.release_gpu(num_cores)
+                self.dispatch_gpu_task()
+
+    def on_task_step_complete(
+        self,
+        trial_state: TrialState,
+        worker_type: WorkerType,
+        num_cores: int,
+    ) -> None:
+        self.log(
+            "info",
+            f"Task 階段完成, num_cores: {num_cores}",
+            worker_type=worker_type,
+            trial_id=trial_state.id,
+        )
+        self.tuner.on_trial_step_complete.remote(
+            self.worker_state.id,
+            trial_state.id,
+            {
+                "accuracy": trial_state.accuracy,
+                "checkpoint": trial_state.checkpoint,
+                "generation": trial_state.generation,
+            },
+        )
+
+        match worker_type:
+            case WorkerType.CPU:
+                self.worker_resource.release_cpu(num_cores)
+                self.dispatch_cpu_task()
+            case WorkerType.GPU:
+                self.worker_resource.release_gpu(num_cores)
+                self.dispatch_gpu_task()
 
     @timer()
     def _trial_load_checkpoint(self, trial_state: TrialState) -> None:
@@ -224,171 +437,111 @@ class Worker:
         else:
             trial_state.remove_remote_checkpoint()
 
-    @timer()
-    def assign_trial(self, trial_state: TrialState) -> None:
-        """
-        將試驗分配給該 worker 並開始訓練。
-
-        Args:
-            trial_state (TrialState): 試驗狀態。
-
-        Returns:
-            TrialState: 更新後的試驗狀態。
-        """
-        if len(self.active_trials) >= self.worker_state.max_trials:
-            return
-
-        self.log("info", "接收到新的 Trial", trial_id=trial_state.id)
-        self._trial_load_checkpoint(trial_state)
-        self.save_checkpoint(trial_state)
-        trial_state.update_worker_state(self.worker_state)
-        self.active_trials[trial_state.id] = trial_state
-
-    def run(self) -> None:
-        while not self.is_stop:
-            trial_state = min(
-                self.active_trials.values(),
-                key=lambda x: x.generation,
-                default=None,
-            )
-
-            if trial_state is None:
-                continue
-
-            trial_state.set_running()
-            self.trial_manager.update_trial.remote(trial_state)  # type: ignore[reportGeneralTypeIssues]
-
-            self.log(
-                "info",
-                f"開始訓練, chunk_size: {trial_state.chunk_size}",
-                trial_id=trial_state.id,
-            )
-
-            hyper = trial_state.hyperparameter
-
-            train_loader, test_loader, _ = self.dataloader_factory(
-                hyper.batch_size,
-                num_workers=0,
-            )
-
-            model, optimizer = trial_state.model_init_fn(self.device)
-
-            self.train(trial_state, model, optimizer, train_loader, test_loader)
-            self.active_trials.pop(trial_state.id)
-
-    def train(
-        self,
-        trial_state: TrialState,
-        model: nn.Module,
-        optimizer: optim.Optimizer,
-        train_loader: DataLoader,
-        test_loader: DataLoader,
-    ) -> None:
-        """
-        執行試驗的訓練流程。
-
-        Args:
-            trial_state (TrialState): 試驗狀態。
-
-        Returns:
-            TrialState: 訓練後的試驗狀態。
-        """
-
-        for _ in range(trial_state.chunk_size):
-            for _ in range(self.iteration_per_generation):
-                if trial_state.generation >= trial_state.max_generation:
-                    trial_state.set_terminated()
-                    break
-
-                if trial_state.id in self.interrupt_set:
-                    return
-
-                self.train_step(
-                    model,
-                    optimizer,
-                    train_loader,
-                    trial_state.hyperparameter.batch_size,
-                    self.device,
-                )
-
-                trial_state.device_iteration_count[self.worker_state.worker_type] += 1
-
-            trial_state.generation += 1
-            trial_state.accuracy = self.test(model, test_loader)
-
-            self.log(
-                "info",
-                f"Generation: {trial_state.generation} "
-                f"Accuracy: {trial_state.accuracy}",
-                trial_id=trial_state.id,
-            )
-
-            if (
-                trial_state.generation >= trial_state.max_generation
-                or trial_state.accuracy >= trial_state.stop_accuracy
-            ):
-                trial_state.set_terminated()
-                trial_state.update_checkpoint(model, optimizer)
-                self.tuner.on_trial_complete.remote(
-                    self.worker_state.id,
-                    trial_state.id,
-                    trial_state,
-                )
-                return
-
-            baseline = ray.get(self.trial_manager.get_mutation_baseline.remote())  # type: ignore[reportGeneralTypeIssues]
-            mutation_ratio = 0.25
-
-            if trial_state.accuracy <= baseline and random.random() >= mutation_ratio:
-                self.log(
-                    "info",
-                    f"Baseline: {baseline}, Accuracy: {trial_state.accuracy}",
-                    trial_id=trial_state.id,
-                )
-                trial_state.set_need_mutation()
-                trial_state.update_checkpoint(model, optimizer)
-                self.tuner.on_trial_need_mutation.remote(
-                    self.worker_state.id,
-                    trial_state.id,
-                    trial_state,
-                )
-                self.pop_checkpoint(trial_state.id)
-                return
-
-        trial_state.set_pause()
-        trial_state.update_checkpoint(model, optimizer)
-        self.tuner.on_trial_step_complete.remote(
-            self.worker_state.id,
-            trial_state.id,
-            trial_state,
+    def add_cpu_task(self, trial_state: TrialState) -> None:
+        heapq.heappush(
+            self.cpu_task_queue,
+            (trial_state.generation, next(self._task_counter), trial_state),
         )
+        self.dispatch_cpu_task()
 
-    def test(self, model: nn.Module, test_loader: DataLoader) -> float:
-        """
-        使用測試資料對模型進行測試並回傳準確率。
+    def add_gpu_task(self, trial_state: TrialState) -> None:
+        heapq.heappush(
+            self.gpu_task_queue,
+            (trial_state.generation, next(self._task_counter), trial_state),
+        )
+        self.dispatch_cpu_task()
 
-        Args:
-            model (torch.nn.Module): 已訓練的模型。
-            test_loader (torch.utils.data.DataLoader): 測試資料載入器。
+    def initial_worker_queue(
+        self,
+        cpu_trials: list[TrialState],
+        gpu_trials: list[TrialState] | None = None,
+    ) -> None:
+        for trial in cpu_trials:
+            heapq.heappush(
+                self.cpu_task_queue,
+                (trial.generation, next(self._task_counter), trial),
+            )
 
-        Returns:
-            Accuracy: 模型測試結果的準確率。
-        """
-        model.eval()
-        total = 0
-        correct = 0
-        with torch.no_grad():
-            for raw_inputs, raw_targets in test_loader:
-                inputs, targets = (
-                    raw_inputs.to(self.device),
-                    raw_targets.to(self.device),
+        if gpu_trials:
+            for trial in gpu_trials:
+                heapq.heappush(
+                    self.gpu_task_queue,
+                    (trial.generation, next(self._task_counter), trial),
                 )
-                outputs = model(inputs)
-                _, predicted = outputs.max(1)
-                total += targets.size(0)
-                correct += predicted.eq(targets).sum().item()
 
-        return correct / total
+        self.dispatch_gpu_task()
+        self.dispatch_cpu_task()
+
+    def dispatch_cpu_task(self) -> None:
+        self.log(
+            "info",
+            f"Available CPU:{self.worker_resource.available_cpus}",
+        )
+        while self.worker_resource.available_cpus:
+            if not self.cpu_task_queue:
+                self.log("info", "CPU task queue is empty.")
+                return
+
+            peek_trial = self.cpu_task_queue[0][2]
+            num_cpus = self.worker_resource.decide_cpu_allocation(peek_trial)
+
+            if not self.worker_resource.request_cpu(num_cpus):
+                return
+
+            _, _, trial = heapq.heappop(self.cpu_task_queue)
+            self.log(
+                "info",
+                f"訓練指派 CPU:{num_cpus}",
+                trial_id=trial.id,
+                worker_type=WorkerType.CPU,
+            )
+            run_task.options(  # type: ignore[reportGeneralTypeIssues]
+                num_cpus=num_cpus,
+                resources={self.worker_state.node_name: 0.01},
+            ).remote(
+                trial,
+                WorkerType.CPU,
+                num_cpus,
+                self.train_step,
+                self.dataloader_factory,
+                self.trial_manager,
+                ray.get_runtime_context().current_actor,
+            )
+
+    def dispatch_gpu_task(self) -> None:
+        self.log(
+            "info",
+            f"Available GPU:{self.worker_resource.available_gpus}",
+        )
+        while self.worker_resource.available_gpus:
+            if not self.gpu_task_queue:
+                self.log("info", "GPU task queue is empty.")
+                return
+
+            num_gpus = 1
+            if not self.worker_resource.request_gpu(num_gpus):
+                return
+
+            _, _, trial = heapq.heappop(self.gpu_task_queue)
+            self.log(
+                "info",
+                f"訓練指派 GPU:{num_gpus}",
+                trial_id=trial.id,
+                worker_type=WorkerType.GPU,
+            )
+            run_task.options(  # type: ignore[reportGeneralTypeIssues]
+                num_cpus=1,
+                num_gpus=num_gpus,
+                resources={self.worker_state.node_name: 0.01},
+            ).remote(
+                trial,
+                WorkerType.GPU,
+                num_gpus,
+                self.train_step,
+                self.dataloader_factory,
+                self.trial_manager,
+                ray.get_runtime_context().current_actor,
+            )
 
     def get_log_file(self) -> dict[str, int | str]:
         """
@@ -410,7 +563,13 @@ class Worker:
         with Path(log_dir).open("r") as f:
             return {"id": self.worker_state.id, "content": f.read()}
 
-    def log(self, level: str, message: str, trial_id: int | str = "N/A") -> None:
+    def log(
+        self,
+        level: str,
+        message: str,
+        trial_id: int | str = "N/A",
+        worker_type: WorkerType = WorkerType.CPU,
+    ) -> None:
         """
         根據指定的 log 級別輸出訊息。
 
@@ -419,7 +578,7 @@ class Worker:
             message (str): 要記錄的訊息。
             trial_id (Union[int, str], optional): 試驗 ID。預設為 "N/A"。
         """
-        extra = {"trial_id": trial_id}
+        extra = {"trial_id": trial_id, "worker_type": worker_type}
         if level == "info":
             self.logger.info(message, extra=extra)
             return

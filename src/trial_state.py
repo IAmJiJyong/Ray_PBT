@@ -1,6 +1,7 @@
 import copy
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from typing import Any, TypedDict
 
 import ray
 import torch
@@ -20,18 +21,45 @@ from .utils import (
     WorkerType,
 )
 
+ALLOWED_PARTIAL_KEYS = {
+    "accuracy",
+    "checkpoint",
+    "chunk_size",
+    "generation",
+    "hyperparameter",
+    "last_checkpoint_location",
+    "num_cores",
+    "status",
+    "worker_id",
+    "worker_type",
+}
+
+
+class PartialTrialState(TypedDict, total=False):
+    accuracy: float
+    checkpoint: Checkpoint
+    chunk_size: int
+    generation: int
+    hyperparameter: Hyperparameter
+    last_checkpoint_location: CheckpointLocation
+    num_cores: int
+    status: TrialStatus
+    worker_id: int
+    worker_type: WorkerType
+
 
 @dataclass(slots=True)
 class TrialState:
     id: int
     hyperparameter: Hyperparameter
     _raw_model_init_fn: ModelInitFunction
+
     max_generation: int = MAX_GENERATION
     status: TrialStatus = TrialStatus.PENDING
     worker_id: int = -1
     worker_type: WorkerType | None = None
-    run_time: float = 0
     generation: int = 0
+    num_cores: int = 0
     device_iteration_count: dict[WorkerType, int] = field(
         default_factory=lambda: {WorkerType.CPU: 0, WorkerType.GPU: 0},
     )
@@ -57,7 +85,6 @@ class TrialState:
         )
 
     def update_worker_state(self, worker_state: WorkerState) -> None:
-        self.worker_type = worker_state.worker_type
         self.worker_id = worker_state.id
         self.last_checkpoint_location = CheckpointLocation(
             worker_state.id,
@@ -112,20 +139,10 @@ class TrialState:
             raise ValueError(msg)
         self.chunk_size = chunk_size
 
-    def set_terminated(self) -> None:
-        self.status = TrialStatus.TERMINATED
-
-    def set_pause(self) -> None:
-        self.status = TrialStatus.PAUSE
-
-    def set_running(self) -> None:
-        self.status = TrialStatus.RUNNING
-
-    def set_pending(self) -> None:
-        self.status = TrialStatus.PENDING
-
-    def set_need_mutation(self) -> None:
-        self.status = TrialStatus.NEED_MUTATION
-
-    def set_waiting(self) -> None:
-        self.status = TrialStatus.WAITING
+    def update_from_partial(self, partial: PartialTrialState) -> None:
+        for key, value in partial.items():
+            if key in ALLOWED_PARTIAL_KEYS:
+                setattr(self, key, value)
+            else:
+                msg = f"無法更新 TrialState 屬性 '{key}'"
+                raise AttributeError(msg)
