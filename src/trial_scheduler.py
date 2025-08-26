@@ -65,6 +65,7 @@ def stealing_strategy(
     worker_manager: WorkerManager,
     trial_manager: ActorHandle,
     logger: logging.Logger,
+    interrupted_record_set: set[tuple[int, int]],
 ) -> None:
     logger.info("嘗試從 CPU Worker 偷取任務")
     running_workers = (
@@ -79,10 +80,13 @@ def stealing_strategy(
         return
 
     trial_id = worker.active_trials[0]
+
     logger.info("嘗試從 CPU Worker %d 偷取 Trial %d", worker.id, trial_id)
     worker.ref.stealing_trial.remote(trial_id)  # type: ignore[reportGeneralTypeIssues])
     worker_manager.release_slots(worker.id, trial_id)
     ray.get(trial_manager.transition_status.remote(trial_id, TrialStatus.PENDING))  # type: ignore[reportGeneralTypeIssues]
+
+    interrupted_record_set.add((worker.id, trial_id))
 
 
 def get_trial_scheduler_logger() -> logging.Logger:
@@ -154,6 +158,8 @@ class TrialScheduler:
         self.logger.info("初始化完成")
         self._finish_event = Event()
 
+        self.interrupted_record_set: set[tuple[int, int]] = set()
+
     def init_worker_queue(self) -> None:
         for worker_entry in self.worker_manager.gpu_workers.values():
             trials = ray.get(
@@ -202,6 +208,7 @@ class TrialScheduler:
                         self.worker_manager,
                         self.trial_manager,
                         self.logger,
+                        self.interrupted_record_set,
                     )
                 gpu_scheduling(
                     worker_id,
@@ -227,6 +234,9 @@ class TrialScheduler:
 
     def finish(self) -> None:
         self._finish_event.set()
+
+    def is_interrupted(self, worker_id: int, trial_id: int) -> bool:
+        return (worker_id, trial_id) in self.interrupted_record_set
 
     def get_workers_logs(self) -> None:
         """

@@ -101,6 +101,9 @@ class Tuner:
         worker_type: WorkerType,
         partial: PartialTrialState,
     ) -> None:
+        if self.scheduler.is_interrupted(worker_id, trial_id):
+            return
+
         if "accuracy" not in partial:
             self.logger.warning(
                 "Worker %d 回傳的 Trial %d 沒有 accuracy",
@@ -144,6 +147,9 @@ class Tuner:
         worker_type: WorkerType,
         partial: PartialTrialState,
     ) -> None:
+        if self.scheduler.is_interrupted(worker_id, trial_id):
+            return
+
         if "accuracy" not in partial or "generation" not in partial:
             self.logger.warning(
                 "Worker %d 回傳的 Trial %d 沒有 accuracy 或 generation",
@@ -185,6 +191,9 @@ class Tuner:
         worker_type: WorkerType,
         partial: PartialTrialState,
     ) -> None:
+        if self.scheduler.is_interrupted(worker_id, trial_id):
+            return
+
         self.logger.info(
             "🔃 Worker %d 回傳 Trial %d 執行 mutation",
             worker_id,

@@ -1,3 +1,4 @@
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from itertools import islice
 from pathlib import Path
@@ -15,6 +16,74 @@ from src.tuner import Tuner
 from src.utils import Checkpoint, Hyperparameter, get_head_node_address, unzip_file
 
 DEFAULT_DEVICE = torch.device("cpu")
+
+
+def cifar100_data_loader_factory(
+    batch_size: int = 64,
+    num_workers: int = 0,
+) -> tuple[DataLoader, DataLoader, DataLoader]:
+    data_dir = Path(DATASET_PATH).expanduser()
+    if not (Path(data_dir) / "cifar-100-python").exists():
+        print(f"{data_dir} 不存在")
+        Path(data_dir).mkdir(parents=True, exist_ok=True)
+
+    if not (Path(data_dir) / "cifar-100-python").exists():
+        print(f"{Path(data_dir) / 'cifar-100-python'} 不存在")
+
+        torchvision.datasets.CIFAR100(
+            root=data_dir,
+            train=True,
+            download=True,
+            transform=None,
+        )
+        print(f"Dataset downloaded to {data_dir}")
+
+    mean = (0.5071, 0.4867, 0.4408)
+    std = (0.2675, 0.2565, 0.2761)
+
+    train_transform = transforms.Compose(
+        [
+            transforms.RandomCrop(32, padding=4),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            transforms.Normalize(mean, std),
+        ],
+    )
+
+    test_transform = transforms.Compose(
+        [
+            transforms.ToTensor(),
+            transforms.Normalize(mean, std),
+        ],
+    )
+
+    train_dataset = torchvision.datasets.CIFAR100(
+        root=data_dir,
+        train=True,
+        download=False,
+        transform=train_transform,
+    )
+    test_dataset = torchvision.datasets.CIFAR100(
+        root=data_dir,
+        train=False,
+        download=False,
+        transform=test_transform,
+    )
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+    )
+    valid_loader = DataLoader(
+        test_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+    )
+
+    return train_loader, valid_loader, None
 
 
 def cifar10_data_loader_factory(
@@ -114,12 +183,50 @@ def resnet18_init_fn(
     return model, optimizer
 
 
-def generate_trial_states(n: int = 1) -> list[TrialState]:
+def resnet50_init_fn(
+    hyperparameter: Hyperparameter,
+    checkpoint: Checkpoint,
+    device: torch.device,
+) -> tuple[nn.Module, optim.Optimizer]:
+    model = models.resnet50()
+    model.fc = nn.Linear(model.fc.in_features, 100)
+
+    if checkpoint.is_empty():
+        model.to(device)
+        optimizer = optim.SGD(
+            model.parameters(),
+            lr=hyperparameter.lr,
+            momentum=hyperparameter.momentum,
+        )
+
+        return model, optimizer
+
+    model.load_state_dict(checkpoint.model_state_dict)
+    model = model.to(device)
+
+    optimizer = optim.SGD(
+        model.parameters(),
+        lr=hyperparameter.lr,
+        momentum=hyperparameter.momentum,
+    )
+    optimizer.load_state_dict(checkpoint.optimizer_state_dict)
+
+    for param_group in optimizer.param_groups:
+        param_group["lr"] = hyperparameter.lr
+        param_group["momentum"] = hyperparameter.momentum
+
+    return model, optimizer
+
+
+def generate_trial_states(
+    n: int = 1,
+    model_init_fn: Callable = resnet18_init_fn,
+) -> list[TrialState]:
     return [
         TrialState(
             i,
             Hyperparameter.random(),
-            resnet18_init_fn,
+            model_init_fn,
         )
         for i in range(n)
     ]
@@ -159,12 +266,12 @@ if __name__ == "__main__":
             ],
         },
     )
-    trial_states = generate_trial_states(50)
+    trial_states = generate_trial_states(50, resnet50_init_fn)
     tuner = Tuner.options(  # type: ignore[call-arg]
         max_concurrency=5,
         num_cpus=1,
         resources={f"node:{get_head_node_address()}": 0.01},
-    ).remote(trial_states, train_step, cifar10_data_loader_factory)
+    ).remote(trial_states, train_step, cifar100_data_loader_factory)
     ray.get(tuner.run.remote())  # type: ignore[call-arg]
 
     zip_logs_bytes: bytes = ray.get(tuner.get_zipped_log.remote())  # type: ignore[call-arg]
