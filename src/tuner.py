@@ -6,9 +6,10 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+import pandas as pd
 import ray
 
-from .trial_manager import TrialManager
+from .trial_manager import NESTrialManager, PBTTrialManager
 from .trial_scheduler import TrialScheduler
 from .trial_state import PartialTrialState, TrialState
 from .utils import (
@@ -18,6 +19,7 @@ from .utils import (
     WorkerType,
     get_head_node_address,
 )
+from .utils_nes import TuneType
 from .worker_manager import WorkerManager
 
 if TYPE_CHECKING:
@@ -61,15 +63,25 @@ class Tuner:
         trial_states: list[TrialState],
         train_step: TrainStepFunction,
         dataloader_factory: DataloaderFactory,
+        tune_type: TuneType = TuneType.PBT,
     ) -> None:
         self.logger = get_tuner_logger()
         self.logger.info("總共 %d 個 Trial", len(trial_states))
+        self.tune_type = tune_type
 
-        self.trial_manager: ActorHandle = TrialManager.options(
-            max_concurrency=10,
-            num_cpus=1,
-            resources={f"node:{get_head_node_address()}": 0.01},
-        ).remote(trial_states)  # type: ignore[reportGeneralTypeIssues]
+        match self.tune_type:
+            case TuneType.PBT:
+                self.trial_manager: ActorHandle = PBTTrialManager.options(
+                    max_concurrency=10,
+                    num_cpus=1,
+                    resources={f"node:{get_head_node_address()}": 0.01},
+                ).remote(trial_states)  # type: ignore[reportGeneralTypeIssues]
+            case TuneType.NES:
+                self.trial_manager: ActorHandle = NESTrialManager.options(
+                    max_concurrency=10,
+                    num_cpus=1,
+                    resources={f"node:{get_head_node_address()}": 0.01},
+                ).remote(trial_states)  # type: ignore[reportGeneralTypeIssues]
 
         self.worker_manager = WorkerManager(
             ray.get_runtime_context().current_actor,
@@ -84,15 +96,33 @@ class Tuner:
         )
 
     def run(self) -> None:
-        start = time.time()
+        start = time.perf_counter()
         self.logger.info("開始訓練")
         self.scheduler.run()
         self.logger.info("結束訓練")
-        end = time.time()
-        self.logger.info("訓練總時長: %.2f 秒", end - start)
+        end = time.perf_counter()
+        run_time = end - start
+        self.logger.info("訓練總時長: %.2f 秒", run_time)
         self.scheduler.get_workers_logs()
         self.logger.info("Assign: %d", self.worker_manager.assign_count["assign"])
         self.logger.info("Locality: %d", self.worker_manager.assign_count["locality"])
+        acc = ray.get(self.trial_manager.get_history_best_result.remote()).accuracy  # type: ignore[reportGeneralTypeIssues]
+        self.record_results(
+            time=run_time,
+            acc=acc,
+        )
+
+    def record_results(self, time: float, acc: float) -> None:
+        new_row = {"Time": time, "Accuracy": acc}
+        log_dir = Path("~/Documents/workspace/shaogu/Ray_PBT/log").expanduser()
+        log_dir.mkdir(exist_ok=True)
+        log_file = log_dir / f"{self.tune_type}_results.csv"
+        if log_file.exists():
+            df = pd.read_csv(log_file)
+            df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
+        else:
+            df = pd.DataFrame([new_row])
+        df.to_csv(log_file, index=False)
 
     def on_trial_complete(
         self,

@@ -12,6 +12,7 @@ from .config import (
 )
 from .trial_state import PartialTrialState, TrialState
 from .utils import TrialStatus, WorkerType, colored_progress_bar
+from .utils_nes import Distribution, Fitness
 
 ALLOWED_TRANSITION: dict[TrialStatus, set[TrialStatus]] = {
     TrialStatus.PENDING: {TrialStatus.WAITING},
@@ -52,7 +53,28 @@ def get_trial_manager_logger() -> logging.Logger:
     return logger
 
 
-@ray.remote
+def print_trial_states(trial_states: TrialState) -> str:
+    reset = "\033[0m"
+    red = "\033[91m"
+    green = "\033[92m"
+    yellow = "\033[93m"
+    blue = "\033[94m"
+
+    match trial_states.status:
+        case TrialStatus.RUNNING:
+            status = f"{green}{trial_states.status:^11}{reset}"
+        case TrialStatus.PENDING:
+            status = f"{blue}{trial_states.status:^11}{reset}"
+        case TrialStatus.WAITING:
+            status = f"{yellow}{trial_states.status:^11}{reset}"
+        case TrialStatus.TERMINATED:
+            status = f"{red}{trial_states.status:^11}{reset}"
+        case TrialStatus.FAILED:
+            status = f"{trial_states.status}"
+
+    return status
+
+
 class TrialManager:
     def __init__(self, trial_states: list[TrialState]) -> None:
         self.all_trials = {trial.id: trial for trial in trial_states}
@@ -286,20 +308,7 @@ class TrialManager:
         self,
         ratio: float = 0.25,
     ) -> float:
-        accuracy = [
-            trial.accuracy for trial in self.all_trials.values() if trial.accuracy > 0
-        ]
-        quantile_size = math.ceil(len(self.all_trials) * ratio)
-
-        result = heapq.nsmallest(
-            quantile_size,
-            accuracy,
-        )
-
-        if len(result) < quantile_size:
-            return 0.0
-
-        return result[-1]
+        raise NotImplementedError
 
     def get_cached_mutation_baseline(self) -> float:
         return self._mutation_baseline
@@ -327,25 +336,7 @@ class TrialManager:
         self._upper_quantile_trials = self.get_upper_quantile_trials()
 
     def update_trial(self, trial_id: int, partial: PartialTrialState) -> None:
-        trial_state = self._get_trial_or_raise(trial_id)
-        trial_state.update_partial(partial)
-
-        if "accuracy" in partial:
-            if trial_state.accuracy > 0 and (
-                self.history_best is None
-                or trial_state.accuracy > self.history_best.accuracy
-            ):
-                self.history_best = trial_state
-
-            if self.history_best:
-                self.logger.info(
-                    "History best accuracy: %f, %s, iteration: %d",
-                    self.history_best.accuracy,
-                    str(self.history_best.hyperparameter),
-                    self.history_best.generation,
-                )
-            self.maybe_update_mutation_baseline()
-        self.display_trial_result()
+        raise NotImplementedError
 
     def is_finish(self) -> bool:
         self.logger.info(
@@ -376,14 +367,7 @@ class TrialManager:
             return f.read()
 
     def mutation(self) -> PartialTrialState:
-        upper_quantile = self.get_cached_upper_quantile_trials()
-        chose_trial = random.choice(upper_quantile)
-        hyperparameter = chose_trial.hyperparameter.explore()
-
-        return {
-            "hyperparameter": hyperparameter,
-            "checkpoint": chose_trial.checkpoint,
-        }
+        raise NotImplementedError
 
     def display_trial_result(
         self,
@@ -393,9 +377,9 @@ class TrialManager:
             with Path(output_path).open("w") as f:
                 f.write(
                     f"┏{'':━^4}┳{'':━^11}┳{'':━^6}┳{'':━^11}┳{'':━^37}┳{'':━^7}┳{'':━^7}┓\n"
-                    f"┃{'':^4}┃{'':^11}┃{'':^6}┃{'Worker':^11}┃{'Hyparameter':^37}┃{'':^7}┃{'':^7}┃\n"
+                    f"┃{'':^4}┃{'':^11}┃{'':^6}┃{'Worker':^11}┃{'Hyparameter':^59}┃{'':^7}┃{'':^7}┃\n"
                     f"┃{'ID':^4}┃{'Status':^11}┃{'SaveAt':^6}┣{'':━^4}┳{'':━^6}╋{'':━^7}┳{'':━^10}┳{'':━^6}┳{'':━^11}┫{'Gene':^7}┃{'Acc':^7}┃\n"
-                    f"┃{'':^4}┃{'':^11}┃{'':^6}┃{'ID':^4}┃{'TYPE':^6}┃{'lr':^7}┃{'momentum':^10}┃{'bs':^6}┃{'model':^11}┃{'':^7}┃{'':^7}┃\n"
+                    f"┃{'':^4}┃{'':^11}┃{'':^6}┃{'ID':^4}┃{'TYPE':^6}┃{'lr':^7}┃{'momentum':^10}┃┃{'WD':^10}┃┃{'dampening':^10}┃{'bs':^6}┃{'model':^11}┃{'':^7}┃{'':^7}┃\n"
                     f"┣{'':━^4}╋{'':━^11}╋{'':━^6}╋{'':━^4}╋{'':━^6}╋{'':━^7}╋{'':━^10}╋{'':━^6}╋{'':━^11}╋{'':━^7}╋{'':━^7}┫\n",
                 )
 
@@ -417,33 +401,17 @@ class TrialManager:
                     else:
                         save_at = i.last_checkpoint_location.worker_id
 
-                    reset = "\033[0m"
-                    red = "\033[91m"
-                    green = "\033[92m"
-                    yellow = "\033[93m"
-                    blue = "\033[94m"
-
-                    match i.status:
-                        case TrialStatus.RUNNING:
-                            status = f"{green}{i.status:^11}{reset}"
-                        case TrialStatus.PENDING:
-                            status = f"{blue}{i.status:^11}{reset}"
-                        case TrialStatus.WAITING:
-                            status = f"{yellow}{i.status:^11}{reset}"
-                        case TrialStatus.TERMINATED:
-                            status = f"{red}{i.status:^11}{reset}"
-                        case TrialStatus.FAILED:
-                            status = i.status
+                    status = print_trial_states(i)
 
                     f.write(
-                        f"┃{i.id:>4}┃{status:^11}┃{save_at:>6}┃{worker_id:>4}┃{worker_type:^6}┃{h.lr:>7.3f}┃{h.momentum:>10.3f}┃{h.batch_size:>6}┃{h.model_type:^11}┃{i.generation:>7}┃{i.accuracy:>7.3f}┃\n",
+                        f"┃{i.id:>4}┃{status:^11}┃{save_at:>6}┃{worker_id:>4}┃{worker_type:^6}┃{h.lr:>7.6f}┃{h.momentum:>10.6f}┃{h.weight_decay:>10.6f}┃{h.dampening:>10.6f}┃{h.batch_size:>6}┃{h.model_type:^11}┃{i.generation:>7}┃{i.accuracy:>7.3f}┃\n",
                     )
                 timestamp = (datetime.now(UTC) + timedelta(hours=8)).strftime(
                     "%Y-%m-%d %H:%M:%S",
                 )
 
                 f.write(
-                    f"┗{'':━^4}┻{'':━^11}┻{'':━^6}┻{'':━^4}┻{'':━^6}┻{'':━^7}┻{'':━^10}┻{'':━^6}┻{'':━^11}┻{'':━^7}┻{'':━^7}┛\n"
+                    f"┗{'':━^4}┻{'':━^11}┻{'':━^6}┻{'':━^4}┻{'':━^6}┻{'':━^7}┻{'':━^10}┻{'':━^10}┻{'':━^10}┻{'':━^6}┻{'':━^11}┻{'':━^7}┻{'':━^7}┛\n"
                     f"{timestamp}\n",
                 )
 
@@ -476,3 +444,109 @@ class TrialManager:
                 40,
             ),
         )
+
+
+@ray.remote
+class PBTTrialManager(TrialManager):
+    def get_mutation_baseline(
+        self,
+        ratio: float = 0.25,
+    ) -> float:
+        accuracy = [
+            trial.accuracy for trial in self.all_trials.values() if trial.accuracy > 0
+        ]
+        quantile_size = math.ceil(len(self.all_trials) * ratio)
+
+        result = heapq.nsmallest(
+            quantile_size,
+            accuracy,
+        )
+
+        if len(result) < quantile_size:
+            return 0.0
+
+        return result[-1]
+
+    def update_trial(self, trial_id: int, partial: PartialTrialState) -> None:
+        trial_state = self._get_trial_or_raise(trial_id)
+        trial_state.update_partial(partial)
+
+        if "accuracy" in partial:
+            if trial_state.accuracy > 0 and (
+                self.history_best is None
+                or trial_state.accuracy > self.history_best.accuracy
+            ):
+                self.history_best = trial_state
+
+            if self.history_best:
+                self.logger.info(
+                    "History best accuracy: %.2f, %s, iteration: %d",
+                    self.history_best.accuracy,
+                    str(self.history_best.hyperparameter),
+                    self.history_best.generation,
+                )
+            self.maybe_update_mutation_baseline()
+        self.display_trial_result()
+
+    def mutation(self) -> PartialTrialState:
+        upper_quantile = self.get_cached_upper_quantile_trials()
+        chose_trial = random.choice(upper_quantile)
+        hyperparameter = chose_trial.hyperparameter.explore()
+
+        return {
+            "hyperparameter": hyperparameter,
+            "checkpoint": chose_trial.checkpoint,
+        }
+
+
+@ray.remote
+class NESTrialManager(TrialManager):
+    def __init__(
+        self,
+        trial_states: list[TrialState],
+        distribution: Distribution,
+    ) -> None:
+        super().__init__(trial_states)
+        self.distribution = distribution
+
+    def get_mutation_baseline(
+        self,
+        ratio: float = 0.25, #noqa: ARG002
+    ) -> float:
+        return 1.0
+
+    def mutation(self) -> PartialTrialState:
+        hyperparameter = self.distribution.get_new_hyper()
+
+        return {
+            "hyperparameter": hyperparameter,
+        }
+
+    def update_trial(self, trial_id: int, partial: PartialTrialState) -> None:
+        trial_state = self._get_trial_or_raise(trial_id)
+        trial_state.update_partial(partial)
+        acc = trial_state.accuracy
+        hyper = trial_state.hyperparameter
+        self.distribution.update_distribution(
+            fitness=Fitness(
+                accuracy=acc,
+                hyperparameter=hyper,
+            ),
+        )
+
+        if "accuracy" in partial:
+            if trial_state.accuracy > 0 and (
+                self.history_best is None
+                or trial_state.accuracy > self.history_best.accuracy
+            ):
+                self.history_best = trial_state
+
+            if self.history_best:
+                self.logger.info(
+                    "History best accuracy: %.2f, %s, iteration: %d",
+                    self.history_best.accuracy,
+                    str(self.history_best.hyperparameter),
+                    self.history_best.generation,
+                )
+            self.maybe_update_mutation_baseline()
+        self.display_trial_result()

@@ -257,7 +257,7 @@ class Worker:
                     {
                         "worker_id": self.worker_state.id,
                         "worker_type": self.worker_state.worker_type,
-                        "last_checkpoint_location": trial_state.last_checkpoint_location,
+                        "last_checkpoint_location": trial_state.last_checkpoint_location,  # noqa: E501
                     },
                 ),
             )
