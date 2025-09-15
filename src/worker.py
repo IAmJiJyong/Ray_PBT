@@ -135,6 +135,8 @@ class Worker:
         self.saved_checkpoint: dict[int, Checkpoint] = {}
         self.logger.info("初始化完成")
 
+        torch.set_num_threads(int(self.worker_state.num_cpus))
+
     def stealing_trial(self, trial_id: int) -> None:
         trial_state = self.active_trials.get(trial_id, None)
 

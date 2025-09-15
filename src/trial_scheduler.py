@@ -65,6 +65,7 @@ def stealing_strategy(
     worker_manager: WorkerManager,
     trial_manager: ActorHandle,
     logger: logging.Logger,
+    interrupted_record_set: set[tuple[int, int]],
 ) -> None:
     logger.info("嘗試從 CPU Worker 偷取任務")
     running_workers = (
@@ -79,10 +80,13 @@ def stealing_strategy(
         return
 
     trial_id = worker.active_trials[0]
+
     logger.info("嘗試從 CPU Worker %d 偷取 Trial %d", worker.id, trial_id)
     worker.ref.stealing_trial.remote(trial_id)  # type: ignore[reportGeneralTypeIssues])
     worker_manager.release_slots(worker.id, trial_id)
     ray.get(trial_manager.transition_status.remote(trial_id, TrialStatus.PENDING))  # type: ignore[reportGeneralTypeIssues]
+
+    interrupted_record_set.add((worker.id, trial_id))
 
 
 def get_trial_scheduler_logger() -> logging.Logger:
@@ -116,6 +120,7 @@ def get_trial_scheduler_logger() -> logging.Logger:
         file_handler.setLevel(logging.DEBUG)  # 記錄所有級別的日誌
         file_handler.setFormatter(formatter)
         logger.addHandler(file_handler)
+        logger.info("FileHandler: %s", file_handler)
 
     return logger
 
@@ -153,6 +158,8 @@ class TrialScheduler:
 
         self.logger.info("初始化完成")
         self._finish_event = Event()
+
+        self.interrupted_record_set: set[tuple[int, int]] = set()
 
     def init_worker_queue(self) -> None:
         for worker_entry in self.worker_manager.gpu_workers.values():
@@ -202,6 +209,7 @@ class TrialScheduler:
                         self.worker_manager,
                         self.trial_manager,
                         self.logger,
+                        self.interrupted_record_set,
                     )
                 gpu_scheduling(
                     worker_id,
@@ -228,24 +236,19 @@ class TrialScheduler:
     def finish(self) -> None:
         self._finish_event.set()
 
-    def get_workers_logs(self) -> None:
-        """
-        獲取所有工作者的日誌並將其保存到文件中。
-        該方法會將每個工作者的日誌寫入到相應的文件中。
-        """
+    def is_interrupted(self, worker_id: int, trial_id: int) -> bool:
+        return (worker_id, trial_id) in self.interrupted_record_set
+
+    def get_log_file(self) -> str:
         log_dir = None
         for handler in self.logger.handlers:
             if isinstance(handler, logging.FileHandler):
-                log_dir = Path(handler.baseFilename).parent  # 取得資料夾路徑
+                log_dir = handler.baseFilename
                 break
 
-        if log_dir is None:
-            self.logger.error("logs檔案資料夾不存在")
-            return
+        if not log_dir:
+            self.logger.error("Logs direction is not exists")
+            return ""
 
-        for worker_entry in self.worker_manager.workers.values():
-            worker = worker_entry.ref
-
-            future = ray.get(worker.get_log_file.remote())  # type: ignore[reportGeneralTypeIssues]
-            with (Path(log_dir) / f"worker-{future['id']}.log").open("w") as f:
-                f.write(future["content"])
+        with Path(log_dir).open("r") as f:
+            return f.read()

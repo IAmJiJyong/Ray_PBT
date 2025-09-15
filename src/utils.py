@@ -93,17 +93,28 @@ class Hyperparameter:
     @classmethod
     def random(cls) -> "Hyperparameter":
         return cls(
-            lr=random.uniform(0.001, 1),
+            lr=random.uniform(0.001, 0.1),
             momentum=random.uniform(0.001, 1),
-            batch_size=512,
+            batch_size=random.choice([32, 64, 128, 256, 512]),
             model_type=ModelType.RESNET_18,
         )
 
     def explore(self) -> "Hyperparameter":
+        momentum = self.momentum * 1.2
+        if momentum >= 1.0:
+            momentum = self.momentum * 0.8
+
+        lr = self.lr * 0.8
+        lr_lower_bound = 1e-7
+        if lr < lr_lower_bound:
+            lr = self.lr * 1.2
+
+        batch_size = random.choice([32, 64, 128, 256, 512])
+
         return Hyperparameter(
-            self.lr * 0.8,
-            self.momentum * 1.2,
-            self.batch_size,
+            lr,
+            momentum,
+            batch_size,
             self.model_type,
         )
 

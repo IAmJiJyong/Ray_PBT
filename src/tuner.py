@@ -78,6 +78,12 @@ class Tuner:
             dataloader_factory=dataloader_factory,
         )
 
+        ray.get(
+            self.trial_manager.set_worker_states.remote(  # type: ignore[reportGeneralTypeIssues]
+                self.worker_manager.get_worker_states(),
+            ),
+        )
+
         self.scheduler: TrialScheduler = TrialScheduler(
             self.worker_manager,
             self.trial_manager,
@@ -90,7 +96,6 @@ class Tuner:
         self.logger.info("結束訓練")
         end = time.time()
         self.logger.info("訓練總時長: %.2f 秒", end - start)
-        self.scheduler.get_workers_logs()
         self.logger.info("Assign: %d", self.worker_manager.assign_count["assign"])
         self.logger.info("Locality: %d", self.worker_manager.assign_count["locality"])
 
@@ -101,6 +106,9 @@ class Tuner:
         worker_type: WorkerType,
         partial: PartialTrialState,
     ) -> None:
+        if self.scheduler.is_interrupted(worker_id, trial_id):
+            return
+
         if "accuracy" not in partial:
             self.logger.warning(
                 "Worker %d 回傳的 Trial %d 沒有 accuracy",
@@ -144,6 +152,9 @@ class Tuner:
         worker_type: WorkerType,
         partial: PartialTrialState,
     ) -> None:
+        if self.scheduler.is_interrupted(worker_id, trial_id):
+            return
+
         if "accuracy" not in partial or "generation" not in partial:
             self.logger.warning(
                 "Worker %d 回傳的 Trial %d 沒有 accuracy 或 generation",
@@ -185,6 +196,9 @@ class Tuner:
         worker_type: WorkerType,
         partial: PartialTrialState,
     ) -> None:
+        if self.scheduler.is_interrupted(worker_id, trial_id):
+            return
+
         self.logger.info(
             "🔃 Worker %d 回傳 Trial %d 執行 mutation",
             worker_id,
@@ -229,14 +243,28 @@ class Tuner:
             msg = "log_dir not found."
             raise FileNotFoundError(msg)
 
+        # Get trial scheduler log files
+        trial_scheduler_log_content = self.scheduler.get_log_file()
+        with (log_dir / "trial_scheduler.log").open("w") as f:
+            f.write(trial_scheduler_log_content)
+
+        # Get worker log files
+        for worker_entry in self.worker_manager.workers.values():
+            worker = worker_entry.ref
+
+            future = ray.get(worker.get_log_file.remote())  # type: ignore[reportGeneralTypeIssues]
+            with (Path(log_dir) / f"worker-{future['id']}.log").open("w") as f:
+                f.write(future["content"])
+
+        # Get trial manager log file
         trial_manager_log_content = ray.get(
             self.trial_manager.get_log_file.remote(),  # type: ignore[reportGeneralTypeIssues]
         )
         with (log_dir / "trial_manager.log").open("w") as f:
             f.write(trial_manager_log_content)
 
+        # Get worker manager log file
         worker_manager_log_content = self.worker_manager.get_log_file()
-
         with (log_dir / "worker_manager.log").open("w") as f:
             f.write(worker_manager_log_content)
 
