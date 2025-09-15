@@ -106,6 +106,9 @@ class WorkerManager:
         }
         [self.workers[worker_id].ref.run.remote() for worker_id in self.workers]
 
+    def get_worker_states(self) -> dict[int, WorkerState]:
+        return {entry.id: entry.state for entry in self.workers.values()}
+
     def get_avaiable_cpu_workers(self) -> list[WorkerEntry]:
         return [
             worker_entry
@@ -232,20 +235,21 @@ def generate_all_worker_states() -> list[WorkerState]:
 
             resource = node["Resources"]
 
-            gpus = resource.get("GPU", 0)
-            cpus = resource.get("CPU", 1)
+            gpus = int(resource.get("GPU", 0))
+            cpus = int(resource.get("CPU", 1))
 
             if "GPU" in resource:
-                cpus -= 1
-                worker_states.append(
+                cpus -= gpus
+                worker_states.extend(
                     WorkerState(
                         id=next(count_gen),
                         num_cpus=1,
-                        num_gpus=gpus,
+                        num_gpus=1,
                         node_name=f"node:{node_address}",
                         max_trials=GPU_TRIALS_LIMIT,
                         worker_type=WorkerType.GPU,
-                    ),
+                    )
+                    for _ in range(gpus)
                 )
 
             if "CPU" in resource:

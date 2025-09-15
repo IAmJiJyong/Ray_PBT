@@ -266,7 +266,7 @@ if __name__ == "__main__":
             ],
         },
     )
-    trial_states = generate_trial_states(50, resnet50_init_fn)
+    trial_states = generate_trial_states(40, resnet50_init_fn)
     tuner = Tuner.options(  # type: ignore[call-arg]
         max_concurrency=5,
         num_cpus=1,

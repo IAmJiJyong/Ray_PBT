@@ -11,7 +11,7 @@ from .config import (
     TRIAL_PROGRESS_OUTPUT_PATH,
 )
 from .trial_state import PartialTrialState, TrialState
-from .utils import TrialStatus, WorkerType, colored_progress_bar
+from .utils import TrialStatus, WorkerState, WorkerType, colored_progress_bar
 
 ALLOWED_TRANSITION: dict[TrialStatus, set[TrialStatus]] = {
     TrialStatus.PENDING: {TrialStatus.WAITING},
@@ -54,17 +54,24 @@ def get_trial_manager_logger() -> logging.Logger:
 
 @ray.remote
 class TrialManager:
-    def __init__(self, trial_states: list[TrialState]) -> None:
+    def __init__(
+        self,
+        trial_states: list[TrialState],
+    ) -> None:
         self.all_trials = {trial.id: trial for trial in trial_states}
         self.pending_ids = {trial.id for trial in trial_states}
         self.running_ids = set()
         self.completed_ids = set()
         self.waiting_ids = set()
         self.history_best: TrialState | None = None
+        self.worker_states: list[WorkerState] = []
 
         self._mutation_baseline: float = 0.0
         self._upper_quantile_trials: list[TrialState] = []
         self.logger = get_trial_manager_logger()
+
+    def set_worker_states(self, worker_states: list[WorkerState]) -> None:
+        self.worker_states = worker_states
 
     def _get_trial_or_raise(self, trial_id: int) -> TrialState:
         trial = self.all_trials.get(trial_id)
@@ -385,6 +392,47 @@ class TrialManager:
             "checkpoint": chose_trial.checkpoint,
         }
 
+    def _worker_type_to_str(self, worker_type: WorkerType | None) -> str:
+        match worker_type:
+            case WorkerType.CPU:
+                return "CPU"
+            case WorkerType.GPU:
+                return "GPU"
+            case _:
+                return ""
+
+    def _worker_id_to_str(self, worker_id: int) -> str:
+        if worker_id == -1:
+            return ""
+        return str(worker_id)
+
+    def _save_at_to_str(self, trial: TrialState) -> str:
+        if trial.last_checkpoint_location.is_empty():
+            return ""
+        return str(trial.last_checkpoint_location.worker_id)
+
+    def _trial_status_to_str(self, status: TrialStatus) -> str:
+        reset = "\033[0m"
+        red = "\033[91m"
+        green = "\033[92m"
+        yellow = "\033[93m"
+        blue = "\033[94m"
+
+        match status:
+            case TrialStatus.RUNNING:
+                return f"{green}{status:^11}{reset}"
+            case TrialStatus.PENDING:
+                return f"{blue}{status:^11}{reset}"
+            case TrialStatus.WAITING:
+                return f"{yellow}{status:^11}{reset}"
+            case TrialStatus.TERMINATED:
+                return f"{red}{status:^11}{reset}"
+            case TrialStatus.FAILED:
+                return f"{status}"
+
+    def _worker_ip_to_str(self, worker_id: int) -> str:
+        return self.worker_states[worker_id].node_name.split(".")[-1]
+
     def display_trial_result(
         self,
         output_path: Path = TRIAL_PROGRESS_OUTPUT_PATH,
@@ -393,57 +441,32 @@ class TrialManager:
             with Path(output_path).open("w") as f:
                 f.write(
                     f"┏{'':━^4}┳{'':━^11}┳{'':━^6}┳{'':━^11}┳{'':━^37}┳{'':━^7}┳{'':━^7}┓\n"
-                    f"┃{'':^4}┃{'':^11}┃{'':^6}┃{'Worker':^11}┃{'Hyparameter':^37}┃{'':^7}┃{'':^7}┃\n"
-                    f"┃{'ID':^4}┃{'Status':^11}┃{'SaveAt':^6}┣{'':━^4}┳{'':━^6}╋{'':━^7}┳{'':━^10}┳{'':━^6}┳{'':━^11}┫{'Gene':^7}┃{'Acc':^7}┃\n"
-                    f"┃{'':^4}┃{'':^11}┃{'':^6}┃{'ID':^4}┃{'TYPE':^6}┃{'lr':^7}┃{'momentum':^10}┃{'bs':^6}┃{'model':^11}┃{'':^7}┃{'':^7}┃\n"
-                    f"┣{'':━^4}╋{'':━^11}╋{'':━^6}╋{'':━^4}╋{'':━^6}╋{'':━^7}╋{'':━^10}╋{'':━^6}╋{'':━^11}╋{'':━^7}╋{'':━^7}┫\n",
+                    f"┃{'':^4}┃{'':^11}┃{'':^6}┃{'Worker':^17}┃{'Hyparameter':^37}┃{'':^7}┃{'':^7}┃\n"
+                    f"┃{'ID':^4}┃{'Status':^11}┃{'SaveAt':^6}┣{'':━^5}┳{'':━^4}┳{'':━^6}╋{'':━^7}┳{'':━^10}┳{'':━^6}┳{'':━^11}┫{'Gene':^7}┃{'Acc':^7}┃\n"
+                    f"┃{'':^4}┃{'':^11}┃{'':^6}┃{'IP':^5}┃{'ID':^4}┃{'TYPE':^6}┃{'lr':^7}┃{'momentum':^10}┃{'bs':^6}┃{'model':^11}┃{'':^7}┃{'':^7}┃\n"
+                    f"┣{'':━^4}╋{'':━^11}╋{'':━^6}╋{'':━^5}╋{'':━^4}╋{'':━^6}╋{'':━^7}╋{'':━^10}╋{'':━^6}╋{'':━^11}╋{'':━^7}╋{'':━^7}┫\n",
                 )
 
                 for i in self.all_trials.values():
-                    match i.worker_type:
-                        case WorkerType.CPU:
-                            worker_type = "CPU"
-                        case WorkerType.GPU:
-                            worker_type = "GPU"
-                        case _:
-                            worker_type = ""
+                    worker_type = self._worker_type_to_str(i.worker_type)
+                    worker_id = self._worker_id_to_str(i.worker_id)
+                    save_at = self._save_at_to_str(i)
+                    status = self._trial_status_to_str(i.status)
+                    ip = ""
+                    if i.worker_id != -1:
+                        ip = self._worker_ip_to_str(i.worker_id)
 
                     h = i.hyperparameter
-                    worker_id = ""
-                    if i.worker_id != -1:
-                        worker_id = i.worker_id
-                    if i.last_checkpoint_location.is_empty():
-                        save_at = ""
-                    else:
-                        save_at = i.last_checkpoint_location.worker_id
-
-                    reset = "\033[0m"
-                    red = "\033[91m"
-                    green = "\033[92m"
-                    yellow = "\033[93m"
-                    blue = "\033[94m"
-
-                    match i.status:
-                        case TrialStatus.RUNNING:
-                            status = f"{green}{i.status:^11}{reset}"
-                        case TrialStatus.PENDING:
-                            status = f"{blue}{i.status:^11}{reset}"
-                        case TrialStatus.WAITING:
-                            status = f"{yellow}{i.status:^11}{reset}"
-                        case TrialStatus.TERMINATED:
-                            status = f"{red}{i.status:^11}{reset}"
-                        case TrialStatus.FAILED:
-                            status = i.status
 
                     f.write(
-                        f"┃{i.id:>4}┃{status:^11}┃{save_at:>6}┃{worker_id:>4}┃{worker_type:^6}┃{h.lr:>7.3f}┃{h.momentum:>10.3f}┃{h.batch_size:>6}┃{h.model_type:^11}┃{i.generation:>7}┃{i.accuracy:>7.3f}┃\n",
+                        f"┃{i.id:>4}┃{status:^11}┃{save_at:>6}┃{ip:>5}┃{worker_id:>4}┃{worker_type:^6}┃{h.lr:>7.3f}┃{h.momentum:>10.3f}┃{h.batch_size:>6}┃{h.model_type:^11}┃{i.generation:>7}┃{i.accuracy:>7.3f}┃\n",
                     )
                 timestamp = (datetime.now(UTC) + timedelta(hours=8)).strftime(
                     "%Y-%m-%d %H:%M:%S",
                 )
 
                 f.write(
-                    f"┗{'':━^4}┻{'':━^11}┻{'':━^6}┻{'':━^4}┻{'':━^6}┻{'':━^7}┻{'':━^10}┻{'':━^6}┻{'':━^11}┻{'':━^7}┻{'':━^7}┛\n"
+                    f"┗{'':━^4}┻{'':━^11}┻{'':━^6}┻{'':━^5}┻{'':━^4}┻{'':━^6}┻{'':━^7}┻{'':━^10}┻{'':━^6}┻{'':━^11}┻{'':━^7}┻{'':━^7}┛\n"
                     f"{timestamp}\n",
                 )
 
