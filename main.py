@@ -1,3 +1,4 @@
+import argparse
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from itertools import islice
@@ -10,7 +11,12 @@ from torch import nn, optim
 from torch.utils.data import DataLoader
 from torchvision import models, transforms
 
-from src.config import DATASET_PATH
+from src.config import (
+    DATASET_PATH,
+    ITERATION_PER_GENERATION,
+    MAX_GENERATION,
+    STOP_ACCURACY,
+)
 from src.trial_state import TrialState
 from src.tuner import Tuner
 from src.utils import Checkpoint, Hyperparameter, get_head_node_address, unzip_file
@@ -252,6 +258,47 @@ def train_step(
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--trial_num", type=int, default=40)
+    parser.add_argument(
+        "--model",
+        choices=["resnet-18", "resnet-50"],
+        default="resnet-18",
+    )
+    parser.add_argument(
+        "--dataset",
+        choices=["cifar-10", "cifar-100"],
+        default="cifar-10",
+    )
+
+    args = parser.parse_args()
+
+    trial_num = args.trial_num
+    model_name = args.model
+    dataset = args.dataset
+    print(trial_num, model_name, dataset)
+
+    print(f"STOP_ACCURACY {STOP_ACCURACY}")
+    print(f"MAX_GENERATION {MAX_GENERATION}")
+    print(f"ITERATION_PER_GENERATION {ITERATION_PER_GENERATION}")
+
+    model_fn = resnet18_init_fn
+    output_dir = "ResNet50"
+    match model_name:
+        case "resnet-18":
+            model_fn = resnet18_init_fn
+            output_dir = "ResNet18"
+        case "resnet-50":
+            model_fn = resnet50_init_fn
+            output_dir = "ResNet50"
+
+    dataset_fn = cifar10_data_loader_factory
+    match dataset:
+        case "cifar-10":
+            dataset_fn = cifar10_data_loader_factory
+        case "cifar-100":
+            dataset_fn = cifar100_data_loader_factory
+
     ray.init(
         runtime_env={
             "working_dir": ".",
@@ -266,20 +313,26 @@ if __name__ == "__main__":
             ],
         },
     )
-    trial_states = generate_trial_states(40, resnet50_init_fn)
+    trial_states = generate_trial_states(trial_num, model_fn)
+
+    bs_list = [32, 64, 128, 256, 512]
+    for i in range(len(trial_states)):
+        batch_size = bs_list[i % len(bs_list)]
+        trial_states[i].hyperparameter.batch_size = batch_size
+
     tuner = Tuner.options(  # type: ignore[call-arg]
         max_concurrency=5,
         num_cpus=1,
         resources={f"node:{get_head_node_address()}": 0.01},
-    ).remote(trial_states, train_step, cifar100_data_loader_factory)
+    ).remote(trial_states, train_step, dataset_fn)
     ray.get(tuner.run.remote())  # type: ignore[call-arg]
 
     zip_logs_bytes: bytes = ray.get(tuner.get_zipped_log.remote())  # type: ignore[call-arg]
 
     time_stamp = (datetime.now(UTC) + timedelta(hours=8)).strftime("%Y-%m-%d_%H-%M-%S")
-    zip_output_dir = f"./logs/{time_stamp}/"
+    zip_output_dir = Path("./logs") / output_dir / f"Trial{trial_num}" / time_stamp
 
-    Path(zip_output_dir).mkdir(parents=True, exist_ok=True)
+    zip_output_dir.mkdir(parents=True, exist_ok=True)
     zip_output_path = Path(zip_output_dir) / "logs.zip"
     with Path(zip_output_path).open("wb") as f:
         f.write(zip_logs_bytes)

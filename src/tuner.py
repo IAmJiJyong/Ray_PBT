@@ -136,7 +136,8 @@ class Tuner:
         )
         self.worker_manager.release_slots(worker_id, trial_id)
 
-        if ray.get(self.trial_manager.is_finish.remote()):  # type: ignore[reportGeneralTypeIssues]
+        # type: ignore[reportGeneralTypeIssues]
+        if ray.get(self.trial_manager.is_finish.remote()):
             self.scheduler.finish()
             return
 
@@ -206,7 +207,11 @@ class Tuner:
         )
 
         self.logger.info("Trial %d: 執行mutation", trial_id)
-        mutation_partial = ray.get(self.trial_manager.mutation.remote())  # type: ignore[reportGeneralTypeIssues]
+        # type: ignore[reportGeneralTypeIssues]
+        mutation_partial = ray.get(self.trial_manager.mutation.remote())
+
+        bs_list = [32, 64, 128, 256, 512]
+        mutation_partial["hyperparameter"].batch_size = bs_list[trial_id % len(bs_list)]
 
         self.logger.info(
             "Trial %d 結束mutation, 新超參數: %s",
@@ -252,13 +257,15 @@ class Tuner:
         for worker_entry in self.worker_manager.workers.values():
             worker = worker_entry.ref
 
-            future = ray.get(worker.get_log_file.remote())  # type: ignore[reportGeneralTypeIssues]
+            # type: ignore[reportGeneralTypeIssues]
+            future = ray.get(worker.get_log_file.remote())
             with (Path(log_dir) / f"worker-{future['id']}.log").open("w") as f:
                 f.write(future["content"])
 
         # Get trial manager log file
         trial_manager_log_content = ray.get(
-            self.trial_manager.get_log_file.remote(),  # type: ignore[reportGeneralTypeIssues]
+            # type: ignore[reportGeneralTypeIssues]
+            self.trial_manager.get_log_file.remote(),
         )
         with (log_dir / "trial_manager.log").open("w") as f:
             f.write(trial_manager_log_content)
