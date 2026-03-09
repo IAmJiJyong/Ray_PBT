@@ -11,11 +11,10 @@ from torch.utils.data import DataLoader
 from .config import (
     ITERATION_PER_GENERATION,
 )
+from .task_strategy import TaskStrategy
 from .trial_state import TrialState
 from .utils import (
     Checkpoint,
-    DataloaderFactory,
-    TrainStepFunction,
     TrialStatus,
     WorkerState,
     WorkerType,
@@ -105,10 +104,9 @@ class Worker:
     def __init__(
         self,
         worker_state: WorkerState,
-        train_step: TrainStepFunction,
+        strategy: TaskStrategy,
         tuner: ActorHandle,
         trial_manager: ActorHandle,
-        dataloader_factory: DataloaderFactory,
     ) -> None:
         """
         初始化 Worker, 設定狀態與參數。
@@ -120,7 +118,7 @@ class Worker:
         """
         self.worker_state: WorkerState = worker_state
         self.active_trials: dict[int, TrialState] = {}
-        self.train_step: TrainStepFunction = train_step
+        self.strategy = strategy
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.logger = get_worker_logger(
             worker_id=worker_state.id,
@@ -130,7 +128,6 @@ class Worker:
         self.trial_manager: ActorHandle = trial_manager
         self.iteration_per_generation: int = ITERATION_PER_GENERATION
         self.interrupt_set: set = set()
-        self.dataloader_factory: DataloaderFactory = dataloader_factory
         self.is_stop: bool = False
         self.saved_checkpoint: dict[int, Checkpoint] = {}
         self.logger.info("初始化完成")
@@ -272,15 +269,23 @@ class Worker:
 
             hyper = trial_state.hyperparameter
 
-            train_loader, test_loader, _ = self.dataloader_factory(
-                hyper.batch_size,
-                num_workers=0,
-            )
+            train_loader, test_loader, _ = self.strategy.build_dataloaders(hyper)
 
-            model, optimizer = trial_state.model_init_fn(self.device)
+            model = self.strategy.build_model(
+                hyper,
+                trial_state.checkpoint,
+                self.device,
+            )
+            optimizer = self.strategy.build_optimizer(
+                model,
+                hyper,
+                trial_state.checkpoint,
+                self.device,
+            )
 
             self.train(trial_state, model, optimizer, train_loader, test_loader)
             self.active_trials.pop(trial_state.id)
+            torch.cuda.empty_cache()
 
     def train(
         self,
@@ -296,10 +301,7 @@ class Worker:
         if int(raw_gen) >= 1:
             iterations = self.iteration_per_generation
         else:
-            iterations = max(
-                1,
-                int(self.iteration_per_generation * raw_gen),
-            )
+            iterations = max(int(self.iteration_per_generation * raw_gen), 1)
 
         self.log(
             "info",
@@ -316,11 +318,10 @@ class Worker:
                 if trial_state.id in self.interrupt_set:
                     return
 
-                self.train_step(
+                self.strategy.train_step(
                     model,
                     optimizer,
                     train_loader,
-                    trial_state.hyperparameter.batch_size,
                     self.device,
                 )
 
@@ -330,7 +331,11 @@ class Worker:
                 return
 
             trial_state.generation += 1
-            trial_state.accuracy = self.test(model, test_loader)
+            trial_state.accuracy = self.strategy.evaluate(
+                model,
+                test_loader,
+                self.device,
+            )
 
             self.log(
                 "info",
@@ -405,33 +410,6 @@ class Worker:
                 "device_iteration_count": trial_state.device_iteration_count,
             },
         )
-
-    def test(self, model: nn.Module, test_loader: DataLoader) -> float:
-        """
-        使用測試資料對模型進行測試並回傳準確率。
-
-        Args:
-            model (torch.nn.Module): 已訓練的模型。
-            test_loader (torch.utils.data.DataLoader): 測試資料載入器。
-
-        Returns:
-            Accuracy: 模型測試結果的準確率。
-        """
-        model.eval()
-        total = 0
-        correct = 0
-        with torch.no_grad():
-            for raw_inputs, raw_targets in test_loader:
-                inputs, targets = (
-                    raw_inputs.to(self.device),
-                    raw_targets.to(self.device),
-                )
-                outputs = model(inputs)
-                _, predicted = outputs.max(1)
-                total += targets.size(0)
-                correct += predicted.eq(targets).sum().item()
-
-        return correct / total
 
     def get_log_file(self) -> dict[str, int | str]:
         """

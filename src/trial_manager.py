@@ -438,40 +438,74 @@ class TrialManager:
         output_path: Path = TRIAL_PROGRESS_OUTPUT_PATH,
     ) -> None:
         try:
-            with Path(output_path).open("w") as f:
-                f.write(
-                    f"┏{'':━^4}┳{'':━^11}┳{'':━^6}┳{'':━^11}┳{'':━^37}┳{'':━^7}┳{'':━^7}┓\n"
-                    f"┃{'':^4}┃{'':^11}┃{'':^6}┃{'Worker':^17}┃{'Hyparameter':^37}┃{'':^7}┃{'':^7}┃\n"
-                    f"┃{'ID':^4}┃{'Status':^11}┃{'SaveAt':^6}┣{'':━^5}┳{'':━^4}┳{'':━^6}╋{'':━^7}┳{'':━^10}┳{'':━^6}┳{'':━^11}┫{'Gene':^7}┃{'Acc':^7}┃\n"
-                    f"┃{'':^4}┃{'':^11}┃{'':^6}┃{'IP':^5}┃{'ID':^4}┃{'TYPE':^6}┃{'lr':^7}┃{'momentum':^10}┃{'bs':^6}┃{'model':^11}┃{'':^7}┃{'':^7}┃\n"
-                    f"┣{'':━^4}╋{'':━^11}╋{'':━^6}╋{'':━^5}╋{'':━^4}╋{'':━^6}╋{'':━^7}╋{'':━^10}╋{'':━^6}╋{'':━^11}╋{'':━^7}╋{'':━^7}┫\n",
-                )
+            with output_path.open("w") as f:
+                # 表頭
+                headers = [
+                    "ID",
+                    "Status",
+                    "SaveAt",
+                    "IP",
+                    "WID",
+                    "Type",
+                    "Hyperparameter",
+                    "Gene",
+                    "Acc",
+                ]
+                widths = [4, 11, 6, 4, 4, 6, 60, 7, 7]  # Hyperparameter 欄位加寬
 
+                # ┏━┳━┓
+                f.write("┏" + "┳".join("━" * w for w in widths) + "┓\n")
+                # 標題列
+                f.write(
+                    "┃" + "┃".join(h.center(w) for h, w in zip(headers, widths)) + "┃\n"
+                )
+                # 分隔線
+                f.write("┣" + "╋".join("━" * w for w in widths) + "┫\n")
+
+                # trial 列
                 for i in self.all_trials.values():
                     worker_type = self._worker_type_to_str(i.worker_type)
                     worker_id = self._worker_id_to_str(i.worker_id)
                     save_at = self._save_at_to_str(i)
                     status = self._trial_status_to_str(i.status)
-                    ip = ""
-                    if i.worker_id != -1:
-                        ip = self._worker_ip_to_str(i.worker_id)
+                    ip = (
+                        self._worker_ip_to_str(i.worker_id)
+                        if i.worker_id != -1
+                        else "-"
+                    )
 
                     h = i.hyperparameter
+                    model_name = getattr(h, "model_name", "-")
+                    momentum = getattr(h, "momentum", 0.0)
 
+                    hyperparam_str = str(h)
+
+                    row = [
+                        str(i.id),
+                        status,
+                        save_at,
+                        ip,
+                        worker_id,
+                        worker_type,
+                        hyperparam_str,
+                        str(i.generation),
+                        f"{i.accuracy:.3f}",
+                    ]
                     f.write(
-                        f"┃{i.id:>4}┃{status:^11}┃{save_at:>6}┃{ip:>5}┃{worker_id:>4}┃{worker_type:^6}┃{h.lr:>7.3f}┃{h.momentum:>10.3f}┃{h.batch_size:>6}┃{h.model_type:^11}┃{i.generation:>7}┃{i.accuracy:>7.3f}┃\n",
+                        "┃"
+                        + "┃".join(val.rjust(w) for val, w in zip(row, widths))
+                        + "┃\n"
                     )
+
+                # 底線
+                f.write("┗" + "┻".join("━" * w for w in widths) + "┛\n")
                 timestamp = (datetime.now(UTC) + timedelta(hours=8)).strftime(
-                    "%Y-%m-%d %H:%M:%S",
+                    "%Y-%m-%d %H:%M:%S"
                 )
+                f.write(f"{timestamp}\n")
 
-                f.write(
-                    f"┗{'':━^4}┻{'':━^11}┻{'':━^6}┻{'':━^5}┻{'':━^4}┻{'':━^6}┻{'':━^7}┻{'':━^10}┻{'':━^6}┻{'':━^11}┻{'':━^7}┻{'':━^7}┛\n"
-                    f"{timestamp}\n",
-                )
-
-        except Exception as e:  # noqa: BLE001
-            print(f"{e}")  # noqa: T201
+        except Exception as e:
+            print(f"Error writing trial results: {e}")
 
     def print_iteration_count(self) -> None:
         iteration_counts = [

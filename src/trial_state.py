@@ -1,11 +1,10 @@
 import copy
-from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TypedDict
 
 import ray
 import torch
-from torch import device, nn, optim
+from torch import nn, optim
 
 from .config import (
     MAX_GENERATION,
@@ -15,7 +14,6 @@ from .utils import (
     Checkpoint,
     CheckpointLocation,
     Hyperparameter,
-    ModelInitFunction,
     TrialStatus,
     WorkerState,
     WorkerType,
@@ -68,7 +66,6 @@ class PartialTrialState(TypedDict, total=False):
 class TrialState:
     id: int
     hyperparameter: Hyperparameter
-    _raw_model_init_fn: ModelInitFunction
 
     max_generation: int = MAX_GENERATION
     status: TrialStatus = TrialStatus.PENDING
@@ -86,19 +83,6 @@ class TrialState:
     accuracy: float = 0.0
     stop_accuracy: float = STOP_ACCURACY
     target_generation: float = 1
-    model_init_fn: Callable[
-        [device],
-        tuple[nn.Module, optim.Optimizer],
-    ] = field(init=False, repr=False, compare=False)
-
-    def __post_init__(self) -> None:
-        self.model_init_fn = (
-            lambda device: self._raw_model_init_fn(
-                self.hyperparameter,
-                self.checkpoint,
-                device,
-            )  # type: ignore[return-value]
-        )
 
     def update_worker_state(self, worker_state: WorkerState) -> None:
         self.worker_type = worker_state.worker_type
