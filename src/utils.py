@@ -80,40 +80,19 @@ class WorkerState:
 @dataclass
 class Hyperparameter:
     lr: float
-    momentum: float
     batch_size: int
-    model_type: ModelType
-
-    def __str__(self) -> str:
-        return (
-            f"Hyperparameter(lr:{self.lr:.3f}, momentum:{self.momentum:.3f}, "
-            f"batch_size:{self.batch_size:4d}, model_type:{self.model_type})"
-        )
 
     @classmethod
     def random(cls) -> "Hyperparameter":
         return cls(
             lr=random.uniform(0.001, 0.1),
-            momentum=random.uniform(0.001, 1),
             batch_size=random.choice([32, 64, 128, 512, 1024]),
-            model_type=ModelType.RESNET_18,
         )
 
     def explore(self) -> "Hyperparameter":
-        momentum = self.momentum * 1.2
-        if momentum > 1.0:
-            momentum = self.momentum * 0.8
-
-        lr = self.lr * 0.8
-        lr_lower_bound = 1e-7
-        if lr < lr_lower_bound:
-            lr = self.lr * 1.2
-
         return Hyperparameter(
             self.lr * 0.8,
-            momentum,
             self.batch_size,
-            self.model_type,
         )
 
 
@@ -150,27 +129,6 @@ class CheckpointLocation:
 
 P = ParamSpec("P")
 R = TypeVar("R")
-
-
-class TrainStepFunction(Protocol[P]):
-    def __call__(self, *args: P.args, **kwargs: P.kwargs) -> None: ...
-
-
-class DataloaderFactory(Protocol):
-    def __call__(
-        self,
-        batch_size: int,
-        num_workers: int,
-    ) -> tuple[DataLoader, DataLoader, DataLoader]: ...
-
-
-class ModelInitFunction(Protocol):
-    def __call__(
-        self,
-        hyperparameter: Hyperparameter,
-        checkpoint: Checkpoint,
-        device: device,
-    ) -> tuple[nn.Module, optim.Optimizer]: ...
 
 
 # ╭──────────────────────────────────────────────────────────╮

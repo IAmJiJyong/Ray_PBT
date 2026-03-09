@@ -9,10 +9,9 @@ from ray.actor import ActorHandle
 
 from src.config import CPU_TRIALS_LIMIT, GPU_TRIALS_LIMIT
 
+from .task_strategy import TaskStrategy
 from .trial_state import TrialState
 from .utils import (
-    DataloaderFactory,
-    TrainStepFunction,
     WorkerState,
     WorkerType,
     get_head_node_address,
@@ -67,8 +66,7 @@ class WorkerManager:
         self,
         tuner: ActorHandle,
         trial_manager: ActorHandle,
-        train_step: TrainStepFunction,
-        dataloader_factory: DataloaderFactory,
+        strategy: TaskStrategy,
     ) -> None:
         self.workers: dict[int, WorkerEntry] = {}
         self.assign_count: dict[str, int] = {"assign": 0, "locality": 0}
@@ -85,10 +83,9 @@ class WorkerManager:
                 resources={worker_state.node_name: 0.01},
             ).remote(
                 worker_state,
-                train_step,
+                strategy,
                 tuner,
                 trial_manager,
-                dataloader_factory,
             )
 
             self.workers[worker_state.id] = WorkerEntry(worker_state, worker_ref)
@@ -256,16 +253,16 @@ def generate_all_worker_states() -> list[WorkerState]:
                 if node_address == head_node_address:
                     cpus -= 2
 
-                worker_states.append(
-                    WorkerState(
-                        id=next(count_gen),
-                        num_cpus=cpus,
-                        num_gpus=0,
-                        node_name=f"node:{node_address}",
-                        max_trials=CPU_TRIALS_LIMIT,
-                        worker_type=WorkerType.CPU,
-                    ),
-                )
+                # worker_states.append(
+                #     WorkerState(
+                #         id=next(count_gen),
+                #         num_cpus=cpus,
+                #         num_gpus=0,
+                #         node_name=f"node:{node_address}",
+                #         max_trials=CPU_TRIALS_LIMIT,
+                #         worker_type=WorkerType.CPU,
+                #     ),
+                # )
             visited_address.add(node_address)
 
     return worker_states

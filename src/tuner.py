@@ -8,12 +8,11 @@ from typing import TYPE_CHECKING
 
 import ray
 
+from .task_strategy import TaskStrategy
 from .trial_manager import TrialManager
 from .trial_scheduler import TrialScheduler
 from .trial_state import PartialTrialState, TrialState
 from .utils import (
-    DataloaderFactory,
-    TrainStepFunction,
     TrialStatus,
     WorkerType,
     get_head_node_address,
@@ -59,8 +58,7 @@ class Tuner:
     def __init__(
         self,
         trial_states: list[TrialState],
-        train_step: TrainStepFunction,
-        dataloader_factory: DataloaderFactory,
+        strategy: TaskStrategy,
     ) -> None:
         self.logger = get_tuner_logger()
         self.logger.info("總共 %d 個 Trial", len(trial_states))
@@ -74,8 +72,7 @@ class Tuner:
         self.worker_manager = WorkerManager(
             ray.get_runtime_context().current_actor,
             self.trial_manager,
-            train_step=train_step,
-            dataloader_factory=dataloader_factory,
+            strategy,
         )
 
         ray.get(
@@ -136,8 +133,7 @@ class Tuner:
         )
         self.worker_manager.release_slots(worker_id, trial_id)
 
-        # type: ignore[reportGeneralTypeIssues]
-        if ray.get(self.trial_manager.is_finish.remote()):
+        if ray.get(self.trial_manager.is_finish.remote()):  # type: ignore[reportGeneralTypeIssues]
             self.scheduler.finish()
             return
 
@@ -207,10 +203,9 @@ class Tuner:
         )
 
         self.logger.info("Trial %d: 執行mutation", trial_id)
-        # type: ignore[reportGeneralTypeIssues]
-        mutation_partial = ray.get(self.trial_manager.mutation.remote())
+        mutation_partial = ray.get(self.trial_manager.mutation.remote())  # type: ignore[reportGeneralTypeIssues]
 
-        bs_list = [32, 64, 128, 256, 512]
+        bs_list = [32, 64, 128]
         mutation_partial["hyperparameter"].batch_size = bs_list[trial_id % len(bs_list)]
 
         self.logger.info(
@@ -230,11 +225,7 @@ class Tuner:
         )
 
         self.worker_manager.release_slots(worker_id, trial_id)
-
-        self.scheduler.assign_trial_to_worker(
-            worker_id,
-            worker_type,
-        )
+        self.scheduler.assign_trial_to_worker(worker_id, worker_type)
 
     def get_zipped_log(self) -> bytes:
         log_dir = None
@@ -257,15 +248,13 @@ class Tuner:
         for worker_entry in self.worker_manager.workers.values():
             worker = worker_entry.ref
 
-            # type: ignore[reportGeneralTypeIssues]
-            future = ray.get(worker.get_log_file.remote())
+            future = ray.get(worker.get_log_file.remote())  # type: ignore[reportGeneralTypeIssues]
             with (Path(log_dir) / f"worker-{future['id']}.log").open("w") as f:
                 f.write(future["content"])
 
         # Get trial manager log file
         trial_manager_log_content = ray.get(
-            # type: ignore[reportGeneralTypeIssues]
-            self.trial_manager.get_log_file.remote(),
+            self.trial_manager.get_log_file.remote(),  # type: ignore[reportGeneralTypeIssues]
         )
         with (log_dir / "trial_manager.log").open("w") as f:
             f.write(trial_manager_log_content)
