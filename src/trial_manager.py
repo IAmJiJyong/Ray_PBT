@@ -195,28 +195,44 @@ class TrialManager:
         if not self.pending_ids:
             return None
 
-        trials = self.get_pending_trials_with_min_iteration()  # type: ignore[reportGeneralTypeIssues]
+        trials = self.get_pending_trials_with_min_iteration()
+        if not trials:
+            return None
 
-        selected_trial = next(
-            (
-                t
-                for t in trials
-                if not t.last_checkpoint_location.is_empty()
-                and t.last_checkpoint_location.worker_id == worker_id
-            ),
-            trials[0],  # 若無符合者, 則選第一個
-        )
+        # Prioritize trials previously assigned to this worker and with checkpoint
+        potential_trials = [
+            t
+            for t in trials
+            if not t.last_checkpoint_location.is_empty()
+            and t.last_checkpoint_location.worker_id == worker_id
+        ]
 
-        selected_trial.set_target_generation(
-            self.compute_target_generation(selected_trial.generation),
+        candidate_trial = potential_trials[0] if potential_trials else trials[0]
+
+        # Retrieve the most up-to-date TrialState from all_trials
+        current_trial_state = self.all_trials[candidate_trial.id]
+
+        # Only proceed if the trial is truly PENDING
+        if current_trial_state.status != TrialStatus.PENDING:
+            self.logger.info(
+                "Trial %d is no longer PENDING "
+                "(current status: {current_trial_state.status}). "
+                "Skipping acquisition.",
+                current_trial_state.id,
+            )
+            return None
+
+        # If it's PENDING, then we can proceed with the transition
+        current_trial_state.set_target_generation(
+            self.compute_target_generation(current_trial_state.generation),
         )
 
         self._transition_to_waiting(
-            selected_trial.id,
+            current_trial_state.id,
             {"worker_id": worker_id, "worker_type": WorkerType.GPU},
         )
 
-        return selected_trial
+        return current_trial_state
 
     def acquire_pending_trial_for_cpu(
         self,
@@ -335,7 +351,29 @@ class TrialManager:
 
     def update_trial(self, trial_id: int, partial: PartialTrialState) -> None:
         trial_state = self._get_trial_or_raise(trial_id)
+
+        old_checkpoint_location = trial_state.last_checkpoint_location
+
         trial_state.update_partial(partial)
+
+        if (
+            not old_checkpoint_location.is_empty()
+            and old_checkpoint_location.worker_id
+            and trial_state.last_checkpoint_location.worker_id
+            != old_checkpoint_location.worker_id
+        ):
+            self.logger.info(
+                "Trial %d 的檢查點位置已從 Worker %d 轉移到 Worker %d。"
+                "通知舊 Worker 刪除其檢查點。",
+                trial_id,
+                old_checkpoint_location.worker_id,
+                trial_state.last_checkpoint_location.worker_id,
+            )
+
+            if old_checkpoint_location.worker_reference:
+                old_checkpoint_location.worker_reference.remove_checkpoint.remote(
+                    trial_id,
+                )
 
         if "accuracy" in partial:
             if trial_state.accuracy > 0 and (

@@ -188,31 +188,56 @@ class Worker:
     def _trial_load_checkpoint(self, trial_state: TrialState) -> None:
         """
         嘗試從檢查點載入試驗狀態。
-
-        Args:
-            trial_state (TrialState): 試驗狀態。
+        根據設計, 權重一律由 scheduler 發送。
+        因此, 優先檢查 trial_state.checkpoint 是否已填充。
+        如果未填充, 則只載入本地保存的 checkpoint。
         """
+        # 1. 檢查 trial_state.checkpoint 是否已由 scheduler 填充
+        if not trial_state.checkpoint.is_empty():
+            self.log(
+                "info",
+                "TrialState 中已包含 checkpoint (由 scheduler 傳遞)",
+                trial_id=trial_state.id,
+            )
+            return  # Checkpoint already available, nothing more to do.
+
+        # If checkpoint is empty in trial_state, check if there's a local checkpoint to load.
         if trial_state.last_checkpoint_location.is_empty():
+            self.log(
+                "warning",
+                "last_checkpoint_location 為空, 無法載入本地 checkpoint",
+                trial_id=trial_state.id,
+            )
             return
 
-        if trial_state.last_checkpoint_location.worker_id in self.saved_checkpoint:
-            self.log("info", "載入本地 checkpoint", trial_id=trial_state.id)
+        # 2. 如果 trial_state.checkpoint 為空, 且 last_checkpoint_location 指向本 worker, 則載入本地 checkpoint
+        if trial_state.last_checkpoint_location.worker_id == self.worker_state.id:
+            self.log("info", "從本地載入 checkpoint", trial_id=trial_state.id)
             checkpoint = self.get_checkpoint(trial_state.id)
             if not checkpoint.is_empty():
                 trial_state.checkpoint = checkpoint
                 self.log(
                     "info",
-                    "載入成功",
+                    "成功從本地載入 checkpoint",
                     trial_id=trial_state.id,
                 )
             else:
                 self.log(
                     "warning",
-                    "載入失敗, Checkpoint 為空",
+                    "本地 checkpoint 為空, 但 last_checkpoint_location 指向本 worker",
                     trial_id=trial_state.id,
                 )
         else:
-            trial_state.remove_remote_checkpoint()
+            # 3. 如果 trial_state.checkpoint 為空, 且 last_checkpoint_location 指向其他 worker
+            #    根據設計 (權重僅由 scheduler 發送), 這表示 scheduler 未能正確傳遞遠端權重。
+            self.log(
+                "error",
+                "TrialState 中無 checkpoint, 且 last_checkpoint_location 指向遠端 worker. "
+                "根據設計, scheduler 應已傳遞權重。請檢查 scheduler 邏輯。",
+                trial_id=trial_state.id,
+            )
+            # Do NOT call trial_state.remove_remote_checkpoint() here, as the worker is not responsible for it.
+            # The scheduler should handle fetching and sending the checkpoint.
 
     @timer()
     def assign_trial(self, trial_state: TrialState) -> None:

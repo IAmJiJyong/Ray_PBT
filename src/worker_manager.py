@@ -251,18 +251,18 @@ def generate_all_worker_states() -> list[WorkerState]:
 
             if "CPU" in resource:
                 if node_address == head_node_address:
-                    cpus -= 2
+                    continue
 
-                # worker_states.append(
-                #     WorkerState(
-                #         id=next(count_gen),
-                #         num_cpus=cpus,
-                #         num_gpus=0,
-                #         node_name=f"node:{node_address}",
-                #         max_trials=CPU_TRIALS_LIMIT,
-                #         worker_type=WorkerType.CPU,
-                #     ),
-                # )
+                worker_states.append(
+                    WorkerState(
+                        id=next(count_gen),
+                        num_cpus=cpus,
+                        num_gpus=0,
+                        node_name=f"node:{node_address}",
+                        max_trials=CPU_TRIALS_LIMIT,
+                        worker_type=WorkerType.CPU,
+                    ),
+                )
             visited_address.add(node_address)
 
     return worker_states

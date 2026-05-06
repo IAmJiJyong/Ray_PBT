@@ -205,8 +205,8 @@ class Tuner:
         self.logger.info("Trial %d: 執行mutation", trial_id)
         mutation_partial = ray.get(self.trial_manager.mutation.remote())  # type: ignore[reportGeneralTypeIssues]
 
-        bs_list = [32, 64, 128]
-        mutation_partial["hyperparameter"].batch_size = bs_list[trial_id % len(bs_list)]
+        # bs_list = [32, 64, 128]
+        # mutation_partial["hyperparameter"].batch_size = bs_list[trial_id % len(bs_list)]
 
         self.logger.info(
             "Trial %d 結束mutation, 新超參數: %s",

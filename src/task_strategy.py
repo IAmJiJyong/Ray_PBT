@@ -1,5 +1,6 @@
 from itertools import islice
 from pathlib import Path
+from random import shuffle
 from typing import Any, Protocol, TypeVar, cast
 
 import torch
@@ -363,8 +364,16 @@ class ResNet50CIFAR100Task(TaskStrategy[CNNHyperparameter]):
         checkpoint: Checkpoint,
         device: device,
     ) -> nn.Module:
-        model = models.resnet50()
-        model.fc = nn.Linear(model.fc.in_features, 100)
+        model = models.resnet50(num_classes=100)
+        model.conv1 = nn.Conv2d(
+            in_channels=3,
+            out_channels=64,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            bias=False,
+        )
+        model.maxpool = nn.Identity()
 
         if checkpoint.is_empty():
             model.to(device)
@@ -457,6 +466,7 @@ class ResNet50CIFAR100Task(TaskStrategy[CNNHyperparameter]):
         train_loader = DataLoader(
             train_dataset,
             batch_size=hyperparameter.batch_size,
+            shuffle=True,
         )
         valid_loader = DataLoader(
             test_dataset,
@@ -476,7 +486,7 @@ class ResNet50CIFAR100Task(TaskStrategy[CNNHyperparameter]):
         model.train()
         criterion = nn.CrossEntropyLoss().to(device)
 
-        for raw_inputs, raw_targets in islice(dataloader, 1):
+        for raw_inputs, raw_targets in dataloader:
             inputs, targets = raw_inputs.to(device), raw_targets.to(device)
             optimizer.zero_grad()
             outputs = model(inputs)

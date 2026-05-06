@@ -13,8 +13,8 @@ from src.config import (
     MAX_GENERATION,
     STOP_ACCURACY,
 )
-from src.hyperparameter import BertHyperparameter
-from src.task_strategy import BertSST2Task
+from src.hyperparameter import CNNHyperparameter
+from src.task_strategy import BertSST2Task, ResNet50CIFAR100Task
 from src.trial_state import TrialState
 from src.tuner import Tuner
 from src.utils import get_head_node_address, unzip_file
@@ -28,7 +28,7 @@ def generate_trial_states(
     return [
         TrialState(
             i,
-            BertHyperparameter.random(),
+            CNNHyperparameter.random(),
         )
         for i in range(n)
     ]
@@ -61,23 +61,23 @@ if __name__ == "__main__":
     )
     trial_states = generate_trial_states(trial_num)
 
-    bs_list = [32, 64, 128]
-    for i in range(len(trial_states)):
-        batch_size = bs_list[i % len(bs_list)]
-        trial_states[i].hyperparameter.batch_size = batch_size
+    # bs_list = [32, 64, 128]
+    # for i in range(len(trial_states)):
+    # batch_size = bs_list[i % len(bs_list)]
+    # trial_states[i].hyperparameter.batch_size = batch_size
 
     tuner = Tuner.options(  # type: ignore[call-arg]
         max_concurrency=5,
         num_cpus=1,
         resources={f"node:{get_head_node_address()}": 0.01},
-    ).remote(trial_states, BertSST2Task())
+    ).remote(trial_states, ResNet50CIFAR100Task())
 
     ray.get(tuner.run.remote())  # type: ignore[call-arg]
 
     zip_logs_bytes: bytes = ray.get(tuner.get_zipped_log.remote())  # type: ignore[call-arg]
 
     time_stamp = (datetime.now(UTC) + timedelta(hours=8)).strftime("%Y-%m-%d_%H-%M-%S")
-    zip_output_dir = Path("./logs") / "BERT" / f"Trial{trial_num}" / time_stamp
+    zip_output_dir = Path("./logs") / "ResNet50" / f"Trial{trial_num}" / time_stamp
 
     zip_output_dir.mkdir(parents=True, exist_ok=True)
     zip_output_path = Path(zip_output_dir) / "logs.zip"

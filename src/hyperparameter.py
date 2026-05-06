@@ -21,7 +21,7 @@ class CNNHyperparameter(Hyperparameter):
         return cls(
             lr=random.uniform(0.001, 0.1),
             momentum=random.uniform(0.001, 1),
-            batch_size=random.choice([32, 64, 128, 512, 1024]),
+            batch_size=random.choice([32, 64, 128]),
         )
 
     def explore(self) -> "CNNHyperparameter":
@@ -35,7 +35,7 @@ class CNNHyperparameter(Hyperparameter):
             lr = self.lr * 1.2
 
         return CNNHyperparameter(
-            lr=self.lr * 0.8,
+            lr=lr,
             momentum=momentum,
             batch_size=self.batch_size,
         )

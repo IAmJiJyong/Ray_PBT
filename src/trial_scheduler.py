@@ -30,6 +30,10 @@ def gpu_scheduling(
         trial_manager.acquire_pending_trial_for_gpu.remote(worker_id),  # type: ignore[reportGeneralTypeIssues]
     )
 
+    if selected_trial is None:
+        logger.info(f"Worker {worker_id} did not acquire a pending GPU trial.")
+        return
+
     worker_manager.assign_trial_to_worker(
         worker_entry.id,
         selected_trial,
