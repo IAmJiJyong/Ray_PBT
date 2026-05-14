@@ -10,6 +10,7 @@ import ray
 
 from .config import MUTATION_COOLDOWN
 from .task_strategy import TaskStrategy
+from .tensorboard_manager import TensorBoardManager
 from .trial_manager import TrialManager
 from .trial_scheduler import TrialScheduler
 from .trial_state import PartialTrialState, TrialState
@@ -64,13 +65,19 @@ class Tuner:
     ) -> None:
         self.logger = get_tuner_logger()
         self.logger.info("總共 %d 個 Trial", len(trial_states))
-        self.runs_dir = runs_dir
+
+        self.start_time: float = time.time()
+        self.tb_manager = TensorBoardManager.options(
+            max_concurrency=10,
+            num_cpus=1,
+            resources={f"node:{get_head_node_address()}": 0.01},
+        ).remote(runs_dir, len(trial_states), self.start_time)
 
         self.trial_manager: ActorHandle = TrialManager.options(
             max_concurrency=10,
             num_cpus=1,
             resources={f"node:{get_head_node_address()}": 0.01},
-        ).remote(trial_states)  # type: ignore[reportGeneralTypeIssues]
+        ).remote(trial_states, self.tb_manager)  # type: ignore[reportGeneralTypeIssues]
 
         self.worker_manager = WorkerManager(
             ray.get_runtime_context().current_actor,
@@ -90,12 +97,11 @@ class Tuner:
         )
 
     def run(self) -> None:
-        start = time.time()
         self.logger.info("開始訓練")
         self.scheduler.run()
         self.logger.info("結束訓練")
         end = time.time()
-        self.logger.info("訓練總時長: %.2f 秒", end - start)
+        self.logger.info("訓練總時長: %.2f 秒", end - self.start_time)
         self.logger.info("Assign: %d", self.worker_manager.assign_count["assign"])
         self.logger.info("Locality: %d", self.worker_manager.assign_count["locality"])
 
@@ -109,7 +115,7 @@ class Tuner:
         if self.scheduler.is_interrupted(worker_id, trial_id):
             return
 
-        if "accuracy" not in partial:
+        if "accuracy" not in partial or "generation" not in partial:
             self.logger.warning(
                 "Worker %d 回傳的 Trial %d 沒有 accuracy",
                 worker_id,
@@ -117,6 +123,12 @@ class Tuner:
             )
             msg = "Worker %d 回傳的 Trial %d Partial沒有 accuracy"
             raise ValueError(msg)
+
+        self.tb_manager.add_acc_to_trial.remote(  # type: ignore[]
+            trial_id,
+            partial["accuracy"],
+            partial["generation"],
+        )
 
         self.logger.info(
             "✅ Worker %d Trial %d 完成, Accuracy: %.2f",
@@ -164,6 +176,12 @@ class Tuner:
             error_msg = "Worker %d 回傳的 Trial %d Partial沒有 accuracy 或 generation"
             raise ValueError(error_msg)
 
+        self.tb_manager.add_acc_to_trial.remote(  # type: ignore[]
+            trial_id,
+            partial["accuracy"],
+            partial["generation"],
+        )
+
         self.logger.info(
             "🔃 Worker %d 回傳未完成 Trial %d, Iteration: %d, Accuracy: %.2f",
             worker_id,
@@ -210,6 +228,12 @@ class Tuner:
 
         # bs_list = [32, 64, 128]
         # mutation_partial["hyperparameter"].batch_size = bs_list[trial_id % len(bs_list)]
+
+        self.tb_manager.add_acc_to_trial.remote(  # type: ignore[]
+            trial_id,
+            partial["accuracy"],
+            partial["generation"],
+        )
 
         self.logger.info(
             "Trial %d 結束mutation, 新超參數: %s",

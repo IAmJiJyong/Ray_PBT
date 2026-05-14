@@ -2,14 +2,17 @@ import heapq
 import logging
 import math
 import random
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import ray
+from ray.actor import ActorHandle
 
 from .config import (
     TRIAL_PROGRESS_OUTPUT_PATH,
 )
+from .tensorboard_manager import TensorBoardManager
 from .trial_state import PartialTrialState, TrialState
 from .utils import TrialStatus, WorkerState, WorkerType, colored_progress_bar
 
@@ -57,6 +60,7 @@ class TrialManager:
     def __init__(
         self,
         trial_states: list[TrialState],
+        tensorboard_manager: ActorHandle,
     ) -> None:
         self.all_trials = {trial.id: trial for trial in trial_states}
         self.pending_ids = {trial.id for trial in trial_states}
@@ -65,6 +69,7 @@ class TrialManager:
         self.waiting_ids = set()
         self.history_best: TrialState | None = None
         self.worker_states: list[WorkerState] = []
+        self.tb_manager = tensorboard_manager
 
         self._mutation_baseline: float = 0.0
         self._upper_quantile_trials: list[TrialState] = []
@@ -381,6 +386,8 @@ class TrialManager:
                 or trial_state.accuracy > self.history_best.accuracy
             ):
                 self.history_best = trial_state
+
+            self.tb_manager.add_best_acc_to_global(self.history_best, time.time())
 
             if self.history_best:
                 self.logger.info(
