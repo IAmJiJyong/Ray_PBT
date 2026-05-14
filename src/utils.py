@@ -7,12 +7,10 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum, auto
 from functools import reduce, wraps
-from typing import ParamSpec, Protocol, TypeVar
+from typing import ParamSpec, TypeVar
 
 import ray
 from ray.actor import ActorHandle
-from torch import device, nn, optim
-from torch.utils.data import DataLoader
 
 # ╭──────────────────────────────────────────────────────────╮
 # │                          Enums                           │

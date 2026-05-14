@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 
 import ray
 
+from .config import MUTATION_COOLDOWN
 from .task_strategy import TaskStrategy
 from .trial_manager import TrialManager
 from .trial_scheduler import TrialScheduler
@@ -59,9 +60,11 @@ class Tuner:
         self,
         trial_states: list[TrialState],
         strategy: TaskStrategy,
+        runs_dir: Path,
     ) -> None:
         self.logger = get_tuner_logger()
         self.logger.info("總共 %d 個 Trial", len(trial_states))
+        self.runs_dir = runs_dir
 
         self.trial_manager: ActorHandle = TrialManager.options(
             max_concurrency=10,
@@ -216,6 +219,8 @@ class Tuner:
 
         partial["worker_id"] = -1
         partial["worker_type"] = None
+        partial["mutation_cooldown"] = MUTATION_COOLDOWN
+
         ray.get(
             self.trial_manager.transition_status.remote(  # type: ignore[reportGeneralTypeIssues]
                 trial_id,

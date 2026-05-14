@@ -30,6 +30,7 @@ ALLOWED_PARTIAL_KEYS = {
     "status",
     "worker_id",
     "worker_type",
+    "mutation_cooldown",
 }
 
 
@@ -60,6 +61,7 @@ class PartialTrialState(TypedDict, total=False):
     status: TrialStatus
     worker_id: int
     worker_type: WorkerType | None
+    mutation_cooldown: int
 
 
 @dataclass(slots=True)
@@ -83,6 +85,7 @@ class TrialState:
     accuracy: float = 0.0
     stop_accuracy: float = STOP_ACCURACY
     target_generation: float = 1
+    mutation_cooldown: int = 0
 
     def update_worker_state(self, worker_state: WorkerState) -> None:
         self.worker_type = worker_state.worker_type

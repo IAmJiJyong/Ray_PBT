@@ -20,3 +20,4 @@ TRIAL_PROGRESS_OUTPUT_PATH: Path = Path(
 ).expanduser()
 GPU_TRIALS_LIMIT: int = config.get("gpu_trials_limit", 3)
 CPU_TRIALS_LIMIT: int = config.get("cpu_trials_limit", 1)
+MUTATION_COOLDOWN: int = config.get("mutation_cooldown", 3)

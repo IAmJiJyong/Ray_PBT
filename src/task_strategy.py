@@ -1,6 +1,5 @@
 from itertools import islice
 from pathlib import Path
-from random import shuffle
 from typing import Any, Protocol, TypeVar, cast
 
 import torch
@@ -513,5 +512,159 @@ class ResNet50CIFAR100Task(TaskStrategy[CNNHyperparameter]):
                 _, predicted = outputs.max(1)
                 total += targets.size(0)
                 correct += predicted.eq(targets).sum().item()
+
+        return correct / total
+
+
+class MobileViTTinyImageNetStrategy:
+    def __init__(self) -> None:
+        self.data_root = ""
+        self.num_classes = 200
+
+    # -------------------------
+    # Model
+    # -------------------------
+    def build_model(
+        self,
+        hyperparameter: HyperParameter,
+        checkpoint,
+        device: torch.device,
+    ) -> nn.Module:
+
+        model = timm.create_model(
+            hyperparameter.model_name,
+            pretrained=True,
+            num_classes=self.num_classes,
+        )
+
+        model = model.to(device)
+
+        # load checkpoint (for PBT / resuming)
+        if checkpoint is not None and "model" in checkpoint:
+            model.load_state_dict(checkpoint["model"])
+
+        return model
+
+    # -------------------------
+    # Optimizer
+    # -------------------------
+    def build_optimizer(
+        self,
+        model: nn.Module,
+        hyperparameter: HyperParameter,
+        checkpoint: Checkpoint,
+        device: torch.device,
+    ) -> optim.Optimizer:
+
+        optimizer = optim.AdamW(model.parameters(), lr=hyperparameter.lr)
+
+        if checkpoint is not None and "optimizer" in checkpoint:
+            optimizer.load_state_dict(checkpoint["optimizer"])
+
+        return optimizer
+
+    # -------------------------
+    # Dataloader
+    # -------------------------
+    def build_dataloaders(
+        self,
+        hyperparameter: HyperParameter,
+    ) -> tuple[DataLoader, DataLoader, DataLoader]:
+
+        transform = transforms.Compose(
+            [
+                transforms.Resize((224, 224)),
+                transforms.ToTensor(),
+                transforms.Normalize(
+                    mean=[0.485, 0.456, 0.406],
+                    std=[0.229, 0.224, 0.225],
+                ),
+            ]
+        )
+
+        train_dataset = datasets.ImageFolder(
+            root=f"{self.data_root}/train",
+            transform=transform,
+        )
+
+        val_dataset = datasets.ImageFolder(
+            root=f"{self.data_root}/val",
+            transform=transform,
+        )
+
+        test_dataset = datasets.ImageFolder(
+            root=f"{self.data_root}/val",  # TinyImageNet test通常無label
+            transform=transform,
+        )
+
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=hyperparameter.batch_size,
+            shuffle=True,
+            # num_workers=4,
+            pin_memory=True,
+        )
+
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=hyperparameter.batch_size,
+            shuffle=False,
+            num_workers=4,
+        )
+
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=hyperparameter.batch_size,
+            shuffle=False,
+            num_workers=4,
+        )
+
+        return train_loader, val_loader, test_loader
+
+    # -------------------------
+    # Train step
+    # -------------------------
+    def train_step(
+        self,
+        model: nn.Module,
+        optimizer: optim.Optimizer,
+        dataloader: DataLoader,
+        device: device,
+    ) -> None:
+        model.train()
+        criterion = nn.CrossEntropyLoss()
+
+        for raw_images, raw_labels in dataloader:
+            images = raw_images.to(device)
+            labels = raw_labels.to(device)
+
+            logits = model(images)
+            loss = criterion(logits, labels)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+    def evaluate(
+        self,
+        model: nn.Module,
+        dataloader: DataLoader,
+        device: device,
+    ) -> float:
+
+        model.eval()
+        correct = 0
+        total = 0
+
+        with torch.no_grad():
+            for raw_images, raw_labels in dataloader:
+                images = raw_images.to(device)
+                labels = raw_labels.to(device)
+
+                logits = model(images)
+                preds = logits.argmax(dim=1)
+
+                correct += (preds == labels).sum().item()
+                total += labels.size(0)
 
         return correct / total

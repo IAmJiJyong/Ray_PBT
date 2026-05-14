@@ -66,17 +66,18 @@ if __name__ == "__main__":
     # batch_size = bs_list[i % len(bs_list)]
     # trial_states[i].hyperparameter.batch_size = batch_size
 
+    time_stamp = (datetime.now(UTC) + timedelta(hours=8)).strftime("%Y-%m-%d_%H-%M-%S")
+
     tuner = Tuner.options(  # type: ignore[call-arg]
         max_concurrency=5,
         num_cpus=1,
         resources={f"node:{get_head_node_address()}": 0.01},
+        runs_dir=Path("./runs/ResNet50/Trial30") / time_stamp,
     ).remote(trial_states, ResNet50CIFAR100Task())
 
     ray.get(tuner.run.remote())  # type: ignore[call-arg]
 
     zip_logs_bytes: bytes = ray.get(tuner.get_zipped_log.remote())  # type: ignore[call-arg]
-
-    time_stamp = (datetime.now(UTC) + timedelta(hours=8)).strftime("%Y-%m-%d_%H-%M-%S")
     zip_output_dir = Path("./logs") / "ResNet50" / f"Trial{trial_num}" / time_stamp
 
     zip_output_dir.mkdir(parents=True, exist_ok=True)

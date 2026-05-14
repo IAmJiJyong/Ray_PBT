@@ -350,77 +350,84 @@ class Worker:
                     self.device,
                 )
 
-                trial_state.device_iteration_count[self.worker_state.worker_type] += 1
+                if trial_state.mutation_cooldown:
+                    trial_state.mutation_cooldown -= 1
+
+            trial_state.device_iteration_count[self.worker_state.worker_type] += 1
 
             if trial_state.id in self.interrupt_set:
                 return
 
             trial_state.generation += 1
-            trial_state.accuracy = self.strategy.evaluate(
-                model,
-                test_loader,
-                self.device,
-            )
+            if trial_state.generation >= trial_state.max_generation:
+                break
 
+        trial_state.accuracy = self.strategy.evaluate(
+            model,
+            test_loader,
+            self.device,
+        )
+
+        self.log(
+            "info",
+            f"Generation: {trial_state.generation} Accuracy: {trial_state.accuracy}",
+            trial_id=trial_state.id,
+        )
+
+        if (
+            trial_state.generation >= trial_state.max_generation
+            or trial_state.accuracy >= trial_state.stop_accuracy
+        ):
+            trial_state.update_checkpoint(model, optimizer)
+            self.tuner.on_trial_complete.remote(
+                self.worker_state.id,
+                trial_state.id,
+                self.worker_state.worker_type,
+                {
+                    "accuracy": trial_state.accuracy,
+                    "generation": trial_state.generation,
+                    "checkpoint": trial_state.checkpoint,
+                    "device_iteration_count": trial_state.device_iteration_count,
+                },
+            )
+            return
+
+        baseline = ray.get(self.trial_manager.get_mutation_baseline.remote())  # type: ignore[reportGeneralTypeIssues]
+
+        if trial_state.mutation_cooldown <= 0:
             self.log(
                 "info",
-                f"Generation: {trial_state.generation} "
-                f"Accuracy: {trial_state.accuracy}",
+                f"Skip mutation, cooldown remaining: {trial_state.mutation_cooldown}",
+            )
+        if trial_state.mutation_cooldown > 0 and trial_state.accuracy <= baseline:
+            self.log(
+                "info",
+                f"Baseline: {baseline}, Accuracy: {trial_state.accuracy}",
                 trial_id=trial_state.id,
             )
-
-            # ── 訓練結束 ──────────────────────────────────────────────────────────
-            if (
-                trial_state.generation >= trial_state.max_generation
-                or trial_state.accuracy >= trial_state.stop_accuracy
-            ):
-                trial_state.update_checkpoint(model, optimizer)
-                self.tuner.on_trial_complete.remote(
-                    self.worker_state.id,
-                    trial_state.id,
-                    self.worker_state.worker_type,
-                    {
-                        "accuracy": trial_state.accuracy,
-                        "generation": trial_state.generation,
-                        "checkpoint": trial_state.checkpoint,
-                        "device_iteration_count": trial_state.device_iteration_count,
-                    },
-                )
-                return
-
-            # ── 突變檢查 ──────────────────────────────────────────────────────────
-            baseline = ray.get(self.trial_manager.get_mutation_baseline.remote())  # type: ignore[reportGeneralTypeIssues]
-            mutation_ratio = 0.25
-
-            if trial_state.accuracy <= baseline and random.random() >= mutation_ratio:
-                self.log(
-                    "info",
-                    f"Baseline: {baseline}, Accuracy: {trial_state.accuracy}",
-                    trial_id=trial_state.id,
-                )
-                trial_state.update_checkpoint(model, optimizer)
-                self.tuner.on_trial_need_mutation.remote(
-                    self.worker_state.id,
-                    trial_state.id,
-                    self.worker_state.worker_type,
-                    {
-                        "accuracy": trial_state.accuracy,
-                        "generation": trial_state.generation,
-                        "device_iteration_count": trial_state.device_iteration_count,
-                    },
-                )
-                self.pop_checkpoint(trial_state.id)
-                return
-
-            # ── 更新 Trial ────────────────────────────────────────────────────────
-            self.trial_manager.update_trial.remote(
+            trial_state.update_checkpoint(model, optimizer)
+            self.tuner.on_trial_need_mutation.remote(
+                self.worker_state.id,
                 trial_state.id,
+                self.worker_state.worker_type,
                 {
                     "accuracy": trial_state.accuracy,
                     "generation": trial_state.generation,
                     "device_iteration_count": trial_state.device_iteration_count,
                 },
             )
+            # self.pop_checkpoint(trial_state.id)
+            return
+
+        # ── 更新 Trial ────────────────────────────────────────────────────────
+        self.trial_manager.update_trial.remote(
+            trial_state.id,
+            {
+                "accuracy": trial_state.accuracy,
+                "generation": trial_state.generation,
+                "device_iteration_count": trial_state.device_iteration_count,
+            },
+        )
 
         # ── 目標世代數已達成, 更新檢查點並回報結果 ────────────────────────────
         trial_state.update_checkpoint(model, optimizer)
