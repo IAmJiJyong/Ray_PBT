@@ -1,6 +1,6 @@
 import copy
 from dataclasses import dataclass, field
-from typing import TypedDict
+from typing import TypedDict, TypeVar
 
 import ray
 import torch
@@ -10,10 +10,10 @@ from .config import (
     MAX_GENERATION,
     STOP_ACCURACY,
 )
+from .hyperparameter import Hyperparameter
 from .utils import (
     Checkpoint,
     CheckpointLocation,
-    Hyperparameter,
     TrialStatus,
     WorkerState,
     WorkerType,
@@ -30,7 +30,6 @@ ALLOWED_PARTIAL_KEYS = {
     "status",
     "worker_id",
     "worker_type",
-    "mutation_cooldown",
 }
 
 
@@ -85,7 +84,6 @@ class TrialState:
     accuracy: float = 0.0
     stop_accuracy: float = STOP_ACCURACY
     target_generation: float = 1
-    mutation_cooldown: int = 0
 
     def update_worker_state(self, worker_state: WorkerState) -> None:
         self.worker_type = worker_state.worker_type
@@ -150,3 +148,16 @@ class TrialState:
             msg = "Chunk size must be at least 1"
             raise ValueError(msg)
         self.target_generation = target_generation
+
+
+def generate_trial_states(
+    hyperparameter: type[Hyperparameter],
+    n: int = 1,
+) -> list[TrialState]:
+    return [
+        TrialState(
+            i,
+            hyperparameter.random(),
+        )
+        for i in range(n)
+    ]

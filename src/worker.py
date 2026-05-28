@@ -1,5 +1,4 @@
 import logging
-import random
 from pathlib import Path
 
 import ray
@@ -276,9 +275,9 @@ class Worker:
 
             ray.get(
                 self.trial_manager.transition_status.remote(  # type: ignore[reportGeneralTypeIssues]
-                    trial_state.id,
-                    TrialStatus.RUNNING,
-                    {
+                    trial_id=trial_state.id,
+                    status=TrialStatus.RUNNING,
+                    partial={
                         "worker_id": self.worker_state.id,
                         "worker_type": self.worker_state.worker_type,
                         "last_checkpoint_location": trial_state.last_checkpoint_location,
@@ -301,6 +300,7 @@ class Worker:
                 trial_state.checkpoint,
                 self.device,
             )
+
             optimizer = self.strategy.build_optimizer(
                 model,
                 hyper,
@@ -350,9 +350,6 @@ class Worker:
                     self.device,
                 )
 
-                if trial_state.mutation_cooldown:
-                    trial_state.mutation_cooldown -= 1
-
             trial_state.device_iteration_count[self.worker_state.worker_type] += 1
 
             if trial_state.id in self.interrupt_set:
@@ -375,15 +372,15 @@ class Worker:
         )
 
         if (
-            trial_state.generation >= trial_state.max_generation
-            or trial_state.accuracy >= trial_state.stop_accuracy
+            trial_state.accuracy >= trial_state.stop_accuracy
+            or trial_state.generation >= trial_state.max_generation
         ):
             trial_state.update_checkpoint(model, optimizer)
             self.tuner.on_trial_complete.remote(
-                self.worker_state.id,
-                trial_state.id,
-                self.worker_state.worker_type,
-                {
+                worker_id=self.worker_state.id,
+                trial_id=trial_state.id,
+                worker_type=self.worker_state.worker_type,
+                partial={
                     "accuracy": trial_state.accuracy,
                     "generation": trial_state.generation,
                     "checkpoint": trial_state.checkpoint,
@@ -394,12 +391,7 @@ class Worker:
 
         baseline = ray.get(self.trial_manager.get_mutation_baseline.remote())  # type: ignore[reportGeneralTypeIssues]
 
-        if trial_state.mutation_cooldown <= 0:
-            self.log(
-                "info",
-                f"Skip mutation, cooldown remaining: {trial_state.mutation_cooldown}",
-            )
-        if trial_state.mutation_cooldown > 0 and trial_state.accuracy <= baseline:
+        if trial_state.accuracy <= baseline:
             self.log(
                 "info",
                 f"Baseline: {baseline}, Accuracy: {trial_state.accuracy}",
@@ -407,10 +399,10 @@ class Worker:
             )
             trial_state.update_checkpoint(model, optimizer)
             self.tuner.on_trial_need_mutation.remote(
-                self.worker_state.id,
-                trial_state.id,
-                self.worker_state.worker_type,
-                {
+                worker_id=self.worker_state.id,
+                trial_id=trial_state.id,
+                worker_type=self.worker_state.worker_type,
+                partial={
                     "accuracy": trial_state.accuracy,
                     "generation": trial_state.generation,
                     "device_iteration_count": trial_state.device_iteration_count,
@@ -421,8 +413,8 @@ class Worker:
 
         # ── 更新 Trial ────────────────────────────────────────────────────────
         self.trial_manager.update_trial.remote(
-            trial_state.id,
-            {
+            trial_id=trial_state.id,
+            partial={
                 "accuracy": trial_state.accuracy,
                 "generation": trial_state.generation,
                 "device_iteration_count": trial_state.device_iteration_count,
@@ -432,10 +424,10 @@ class Worker:
         # ── 目標世代數已達成, 更新檢查點並回報結果 ────────────────────────────
         trial_state.update_checkpoint(model, optimizer)
         self.tuner.on_trial_step_complete.remote(
-            self.worker_state.id,
-            trial_state.id,
-            self.worker_state.worker_type,
-            {
+            worker_id=self.worker_state.id,
+            trial_id=trial_state.id,
+            worker_type=self.worker_state.worker_type,
+            partial={
                 "accuracy": trial_state.accuracy,
                 "generation": trial_state.generation,
                 "checkpoint": trial_state.checkpoint,

@@ -1,3 +1,4 @@
+import inspect
 import logging
 import random
 import time
@@ -7,9 +8,11 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum, auto
 from functools import reduce, wraps
-from typing import ParamSpec, TypeVar
+from typing import Any, ParamSpec, TypeVar
 
+import psutil
 import ray
+import torch
 from ray.actor import ActorHandle
 
 # ╭──────────────────────────────────────────────────────────╮
@@ -247,3 +250,75 @@ def timer() -> Callable[[Callable[P, R]], Callable[P, R]]:
         return wrapper
 
     return decorator
+
+
+def resource_monitor() -> Callable[[Callable[P, R]], Callable[P, R]]:
+    def decorator(func: Callable[P, R]) -> Callable[P, R]:
+        @wraps(func)
+        def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
+            self = args[0]
+            result = func(*args, **kwargs)
+
+            tb_manager = getattr(self, "tb_manager", None)
+            worker_state = getattr(self, "worker_state", None)
+
+            if tb_manager and worker_state:
+                cpu_usage = psutil.cpu_percent()
+                mem_mb = psutil.Process().memory_info().rss / (1024 * 1024)
+
+                gpu_usage = 0.0
+                gpu_mem = 0.0
+                if torch.cuda.is_available():
+                    # 取得目前 GPU 的記憶體使用量 (MB)
+                    gpu_mem = torch.cuda.memory_allocated() / (1024 * 1024)
+                    # 註：GPU 利用率 % 通常需要 pynvml，簡單實作可先記為 0 或僅紀錄記憶體
+
+                # 異步傳送數據到 TensorBoard
+                self.tb_manager.add_resource_usage.remote(
+                    worker_id=self.worker_state.id,
+                    cpu=cpu_usage,
+                    mem=mem_mb,
+                    gpu=gpu_usage,
+                    gpu_mem=gpu_mem,
+                    timestamp=time.time(),
+                )
+
+            return result
+
+        return wrapper
+
+    return decorator
+
+
+def rc(func: Callable[P, R]) -> Callable[P, R]:
+    signature = inspect.signature(func)
+
+    @wraps(func)
+    def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
+        bound = signature.bind(*args, **kwargs)
+        bound.apply_defaults()
+
+        self_obj = bound.arguments["self"]
+        trial_id = bound.arguments["trial_id"]
+        fn_anme = func.__name__
+
+        try:
+            self_obj.rc[trial_id] += 1
+            self_obj.logger.debug(
+                "Enter `%s` trial_id=%d, rc=%d",
+                fn_anme,
+                trial_id,
+                self_obj.rc[trial_id],
+            )
+            return func(*bound.args, **bound.kwargs)
+
+        finally:
+            self_obj.rc[trial_id] -= 1
+            self_obj.logger.debug(
+                "Exit  `%s` trial_id=%d, rc=%d",
+                fn_anme,
+                trial_id,
+                self_obj.rc[trial_id],
+            )
+
+    return wrapper

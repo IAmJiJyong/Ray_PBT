@@ -8,7 +8,6 @@ from typing import TYPE_CHECKING
 
 import ray
 
-from .config import MUTATION_COOLDOWN
 from .task_strategy import TaskStrategy
 from .tensorboard_manager import TensorBoardManager
 from .trial_manager import TrialManager
@@ -74,7 +73,6 @@ class Tuner:
         ).remote(runs_dir, len(trial_states), self.start_time)
 
         self.trial_manager: ActorHandle = TrialManager.options(
-            max_concurrency=10,
             num_cpus=1,
             resources={f"node:{get_head_node_address()}": 0.01},
         ).remote(trial_states, self.tb_manager)  # type: ignore[reportGeneralTypeIssues]
@@ -243,8 +241,6 @@ class Tuner:
 
         partial["worker_id"] = -1
         partial["worker_type"] = None
-        partial["mutation_cooldown"] = MUTATION_COOLDOWN
-
         ray.get(
             self.trial_manager.transition_status.remote(  # type: ignore[reportGeneralTypeIssues]
                 trial_id,

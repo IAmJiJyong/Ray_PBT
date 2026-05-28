@@ -2,7 +2,7 @@ import json
 from pathlib import Path
 
 config = {}
-path = Path.resolve(Path(Path(__file__).parent) / "../config.json")
+path = Path.resolve(Path(__file__).parent / "../config.json")
 
 if Path.exists(path):
     with Path(path).open("r") as f:
@@ -20,4 +20,3 @@ TRIAL_PROGRESS_OUTPUT_PATH: Path = Path(
 ).expanduser()
 GPU_TRIALS_LIMIT: int = config.get("gpu_trials_limit", 3)
 CPU_TRIALS_LIMIT: int = config.get("cpu_trials_limit", 1)
-MUTATION_COOLDOWN: int = config.get("mutation_cooldown", 3)

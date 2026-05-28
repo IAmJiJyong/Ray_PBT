@@ -57,8 +57,9 @@ class BertHyperparameter(Hyperparameter):
 
     def __str__(self) -> str:
         return (
-            f"BertSst2Hyperparameter(lr={self.lr:.1e}, batch_size={self.batch_size}, "
-            f"weight_decay={self.weight_decay})"
+            f"lr={self.lr:.1e}, "
+            f"batch_size={self.batch_size}, "
+            f"weight_decay={self.weight_decay:.1e}"
         )
 
     @classmethod
@@ -68,11 +69,11 @@ class BertHyperparameter(Hyperparameter):
         """
         return cls(
             lr=random.uniform(1e-4, 1e-5),
-            batch_size=random.choice([2, 4, 8, 16, 32]),
-            weight_decay=0.0,
+            batch_size=random.choice([16, 32, 64, 128]),
+            weight_decay=random.uniform(1e-1, 1e-4),
             adam_epsilon=1e-8,
             warmup_steps=0,
-            max_seq_length=random.choice([64, 128]),
+            max_seq_length=128,
         )
 
     def explore(self) -> "BertHyperparameter":
