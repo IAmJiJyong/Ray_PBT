@@ -3,6 +3,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from itertools import count
 from pathlib import Path
+from threading import RLock
 
 import ray
 from ray.actor import ActorHandle
@@ -15,6 +16,7 @@ from .utils import (
     WorkerState,
     WorkerType,
     get_head_node_address,
+    synchronized,
 )
 from .worker import Worker
 
@@ -68,15 +70,17 @@ class WorkerManager:
         trial_manager: ActorHandle,
         strategy: TaskStrategy,
     ) -> None:
+        self.lock = RLock()
         self.workers: dict[int, WorkerEntry] = {}
         self.assign_count: dict[str, int] = {"assign": 0, "locality": 0}
         self.logger: logging.Logger = get_worker_manager_logger()
 
         worker_states = generate_all_worker_states()
 
+        self.worker_lock = {worker_state.id: RLock() for worker_state in worker_states}
         for worker_state in worker_states:
             worker_ref: ActorHandle = Worker.options(  # type: ignore[reportGeneralTypeIssues]
-                max_concurrency=worker_state.max_trials + 3,
+                max_concurrency=worker_state.max_trials + 1,
                 name=f"worker-{worker_state.id}",
                 num_cpus=worker_state.num_cpus,
                 num_gpus=worker_state.num_gpus,
@@ -103,9 +107,11 @@ class WorkerManager:
         }
         [self.workers[worker_id].ref.run.remote() for worker_id in self.workers]
 
+    @synchronized
     def get_worker_states(self) -> dict[int, WorkerState]:
         return {entry.id: entry.state for entry in self.workers.values()}
 
+    @synchronized
     def get_avaiable_cpu_workers(self) -> list[WorkerEntry]:
         return [
             worker_entry
@@ -113,6 +119,7 @@ class WorkerManager:
             if worker_entry.available_slots > 0
         ]
 
+    @synchronized
     def get_avaiable_gpu_workers(self) -> list[WorkerEntry]:
         return [
             worker_entry
@@ -125,64 +132,71 @@ class WorkerManager:
         worker_id: int,
         trial_states: list[TrialState],
     ) -> None:
-        entry = self.workers.get(worker_id, None)
-        if entry is None:
-            msg = f"Worker {worker_id} 不存在."
-            raise ValueError(msg)
-
-        for trial in trial_states:
-            if entry.available_slots <= 0:
-                msg = f"Worker {worker_id} 沒有可用的 slot. {entry.active_trials}"
+        with self.worker_lock[worker_id]:
+            entry = self.workers.get(worker_id, None)
+            if entry is None:
+                msg = f"Worker {worker_id} 不存在."
                 raise ValueError(msg)
 
-            entry.active_trials.append(trial.id)
-        entry.ref.init_trial_queue.remote(trial_states)
+            for trial in trial_states:
+                if entry.available_slots <= 0:
+                    msg = f"Worker {worker_id} 沒有可用的 slot. {entry.active_trials}"
+                    raise ValueError(msg)
+
+                entry.active_trials.append(trial.id)
+            entry.ref.init_trial_queue.remote(trial_states)
 
     def assign_trial_to_worker(
         self,
         worker_id: int,
         trial: TrialState,
     ) -> None:
-        entry = self.workers.get(worker_id, None)
-        if entry is None:
-            msg = f"Worker {worker_id} 不存在."
-            raise ValueError(msg)
+        with self.worker_lock[worker_id]:
+            entry = self.workers.get(worker_id, None)
+            if entry is None:
+                msg = f"Worker {worker_id} 不存在."
+                raise ValueError(msg)
 
-        entry.active_trials.append(trial.id)
-        self.logger.info(
-            "Active trials on Worker %d: %s",
-            worker_id,
-            entry.active_trials,
-        )
-        self.assign_count["assign"] += 1
+            if trial.last_checkpoint_location.worker_id == worker_id:
+                self.logger.info(
+                    "分配 Trial %d snapshot 到 Worker %d",
+                    trial.id,
+                    worker_id,
+                )
+                self.assign_count["locality"] += 1
+                ray.get(
+                    entry.ref.assign_trial.remote(trial.snapshot),  # type: ignore[reportGeneralTypeIssues]
+                )
+            else:
+                self.logger.info(
+                    "分配 Trial %d 到 Worker %d",
+                    trial.id,
+                    worker_id,
+                )
+                ray.get(
+                    entry.ref.assign_trial.remote(trial),  # type: ignore[reportGeneralTypeIssues]
+                )
 
-        if trial.last_checkpoint_location.worker_id == worker_id:
+            entry.active_trials.append(trial.id)
             self.logger.info(
-                "分配 Trial %d snapshot 到 Worker %d",
-                trial.id,
+                "Active trials on Worker %d: %s",
                 worker_id,
+                entry.active_trials,
             )
-            self.assign_count["locality"] += 1
-            entry.ref.assign_trial.remote(trial.snapshot)  # type: ignore[reportGeneralTypeIssues]
-        else:
-            self.logger.info(
-                "分配 Trial %d 到 Worker %d",
-                trial.id,
-                worker_id,
-            )
-            entry.ref.assign_trial.remote(trial)  # type: ignore[reportGeneralTypeIssues]
+            self.assign_count["assign"] += 1
 
     def release_slots(self, worker_id: int, trial_id: int) -> None:
-        entry = self.workers.get(worker_id, None)
-        if entry is None:
-            msg = f"Worker {worker_id} 不存在."
-            raise ValueError(msg)
+        with self.worker_lock[worker_id]:
+            entry = self.workers.get(worker_id, None)
+            if entry is None:
+                msg = f"Worker {worker_id} 不存在."
+                raise ValueError(msg)
 
-        try:
-            entry.active_trials.remove(trial_id)
-        except ValueError:
-            msg = f"Trial {trial_id} 不存在於 {entry.active_trials}"
-            self.logger.exception(msg)
+            try:
+                entry.active_trials.remove(trial_id)
+            except ValueError:
+                msg = f"Trial {trial_id} 不存在於 {entry.active_trials}"
+                self.logger.exception(msg)
 
     def stop_all_workers(self) -> None:
         ray.get(
@@ -237,7 +251,7 @@ def generate_all_worker_states() -> list[WorkerState]:
 
             if "GPU" in resource:
                 cpus -= gpus
-                worker_states.extend(
+                worker_states.append(
                     WorkerState(
                         id=next(count_gen),
                         num_cpus=1,
@@ -245,9 +259,20 @@ def generate_all_worker_states() -> list[WorkerState]:
                         node_name=f"node:{node_address}",
                         max_trials=GPU_TRIALS_LIMIT,
                         worker_type=WorkerType.GPU,
-                    )
-                    for _ in range(gpus)
+                    ),
                 )
+
+                # worker_states.extend(
+                #     WorkerState(
+                #         id=next(count_gen),
+                #         num_cpus=1,
+                #         num_gpus=1,
+                #         node_name=f"node:{node_address}",
+                #         max_trials=GPU_TRIALS_LIMIT,
+                #         worker_type=WorkerType.GPU,
+                #     )
+                #     for _ in range(gpus)
+                # )
 
             if "CPU" in resource:
                 if node_address == head_node_address:

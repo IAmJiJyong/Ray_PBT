@@ -1,5 +1,7 @@
 import logging
 from pathlib import Path
+from threading import RLock
+from time import sleep
 
 import ray
 import torch
@@ -130,6 +132,7 @@ class Worker:
         self.is_stop: bool = False
         self.saved_checkpoint: dict[int, Checkpoint] = {}
         self.logger.info("初始化完成")
+        self.lock = RLock()
 
         torch.set_num_threads(int(self.worker_state.num_cpus))
 
@@ -250,13 +253,21 @@ class Worker:
             TrialState: 更新後的試驗狀態。
         """
         if len(self.active_trials) >= self.worker_state.max_trials:
+            self.log("info", "Trial 序列以滿")
             return
 
-        self.log("info", "接收到新的 Trial", trial_id=trial_state.id)
-        self._trial_load_checkpoint(trial_state)
-        self.save_checkpoint(trial_state)
-        trial_state.update_worker_state(self.worker_state)
-        self.active_trials[trial_state.id] = trial_state
+        with self.lock:
+            self.log("info", "接收到新的 Trial", trial_id=trial_state.id)
+            self.log(
+                "info",
+                f"Trial Generation: {trial_state.generation}",
+                trial_id=trial_state.id,
+            )
+            self._trial_load_checkpoint(trial_state)
+            self.save_checkpoint(trial_state)
+            trial_state.update_worker_state(self.worker_state)
+            self.active_trials[trial_state.id] = trial_state
+            self.log("info", f"Active trials: {list(self.active_trials.keys())}")
 
     def init_trial_queue(self, trials: list[TrialState]) -> None:
         for trial_state in trials:
@@ -264,13 +275,15 @@ class Worker:
 
     def run(self) -> None:
         while not self.is_stop:
-            trial_state = min(
-                self.active_trials.values(),
-                key=lambda x: x.generation,
-                default=None,
-            )
+            with self.lock:
+                trial_state = min(
+                    self.active_trials.values(),
+                    key=lambda x: x.generation,
+                    default=None,
+                )
 
             if trial_state is None:
+                sleep(5)
                 continue
 
             ray.get(
@@ -293,7 +306,10 @@ class Worker:
 
             hyper = trial_state.hyperparameter
 
-            train_loader, test_loader, _ = self.strategy.build_dataloaders(hyper)
+            train_loader, test_loader, _ = self.strategy.build_dataloaders(
+                hyper,
+                self.device,
+            )
 
             model = self.strategy.build_model(
                 hyper,
@@ -308,8 +324,9 @@ class Worker:
                 self.device,
             )
 
+            with self.lock:
+                self.active_trials.pop(trial_state.id)
             self.train(trial_state, model, optimizer, train_loader, test_loader)
-            self.active_trials.pop(trial_state.id)
             torch.cuda.empty_cache()
 
     def train(
@@ -359,6 +376,13 @@ class Worker:
             if trial_state.generation >= trial_state.max_generation:
                 break
 
+            self.trial_manager.update_trial.remote(
+                trial_id=trial_state.id,
+                partial={
+                    "generation": trial_state.generation,
+                },
+            )
+
         trial_state.accuracy = self.strategy.evaluate(
             model,
             test_loader,
@@ -376,17 +400,20 @@ class Worker:
             or trial_state.generation >= trial_state.max_generation
         ):
             trial_state.update_checkpoint(model, optimizer)
-            self.tuner.on_trial_complete.remote(
-                worker_id=self.worker_state.id,
-                trial_id=trial_state.id,
-                worker_type=self.worker_state.worker_type,
-                partial={
-                    "accuracy": trial_state.accuracy,
-                    "generation": trial_state.generation,
-                    "checkpoint": trial_state.checkpoint,
-                    "device_iteration_count": trial_state.device_iteration_count,
-                },
+            ray.get(
+                self.tuner.on_trial_complete.remote(  # type:ignore[]
+                    worker_id=self.worker_state.id,
+                    trial_id=trial_state.id,
+                    worker_type=self.worker_state.worker_type,
+                    partial={
+                        "accuracy": trial_state.accuracy,
+                        "generation": trial_state.generation,
+                        "checkpoint": trial_state.checkpoint,
+                        "device_iteration_count": trial_state.device_iteration_count,
+                    },
+                ),
             )
+            self.remove_checkpoint(trial_id=trial_state.id)
             return
 
         baseline = ray.get(self.trial_manager.get_mutation_baseline.remote())  # type: ignore[reportGeneralTypeIssues]
@@ -398,41 +425,47 @@ class Worker:
                 trial_id=trial_state.id,
             )
             trial_state.update_checkpoint(model, optimizer)
-            self.tuner.on_trial_need_mutation.remote(
+            ray.get(
+                self.tuner.on_trial_need_mutation.remote(  # type:ignore[]
+                    worker_id=self.worker_state.id,
+                    trial_id=trial_state.id,
+                    worker_type=self.worker_state.worker_type,
+                    partial={
+                        "accuracy": trial_state.accuracy,
+                        "generation": trial_state.generation,
+                        "device_iteration_count": trial_state.device_iteration_count,
+                    },
+                ),
+            )
+            # self.pop_checkpoint(trial_state.id)
+            return
+
+        # ── 更新 Trial ────────────────────────────────────────────────────────
+        ray.get(
+            self.trial_manager.update_trial.remote(  # type:ignore[]
+                trial_id=trial_state.id,
+                partial={
+                    "accuracy": trial_state.accuracy,
+                    "generation": trial_state.generation,
+                    "device_iteration_count": trial_state.device_iteration_count,
+                },
+            ),
+        )
+
+        # ── 目標世代數已達成, 更新檢查點並回報結果 ────────────────────────────
+        trial_state.update_checkpoint(model, optimizer)
+        ray.get(
+            self.tuner.on_trial_step_complete.remote(  # type:ignore[]
                 worker_id=self.worker_state.id,
                 trial_id=trial_state.id,
                 worker_type=self.worker_state.worker_type,
                 partial={
                     "accuracy": trial_state.accuracy,
                     "generation": trial_state.generation,
+                    "checkpoint": trial_state.checkpoint,
                     "device_iteration_count": trial_state.device_iteration_count,
                 },
-            )
-            # self.pop_checkpoint(trial_state.id)
-            return
-
-        # ── 更新 Trial ────────────────────────────────────────────────────────
-        self.trial_manager.update_trial.remote(
-            trial_id=trial_state.id,
-            partial={
-                "accuracy": trial_state.accuracy,
-                "generation": trial_state.generation,
-                "device_iteration_count": trial_state.device_iteration_count,
-            },
-        )
-
-        # ── 目標世代數已達成, 更新檢查點並回報結果 ────────────────────────────
-        trial_state.update_checkpoint(model, optimizer)
-        self.tuner.on_trial_step_complete.remote(
-            worker_id=self.worker_state.id,
-            trial_id=trial_state.id,
-            worker_type=self.worker_state.worker_type,
-            partial={
-                "accuracy": trial_state.accuracy,
-                "generation": trial_state.generation,
-                "checkpoint": trial_state.checkpoint,
-                "device_iteration_count": trial_state.device_iteration_count,
-            },
+            ),
         )
 
     def get_log_file(self) -> dict[str, int | str]:

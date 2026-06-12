@@ -49,7 +49,7 @@ if __name__ == "__main__":
     timestamp = (datetime.now(UTC) + timedelta(hours=8)).strftime("%Y-%m-%d_%H-%M-%S")
 
     tuner = Tuner.options(  # type: ignore[call-arg]
-        max_concurrency=5,
+        max_concurrency=2,
         num_cpus=1,
         resources={f"node:{get_head_node_address()}": 0.01},
     ).remote(

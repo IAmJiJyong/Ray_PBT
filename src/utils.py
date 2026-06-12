@@ -3,12 +3,13 @@ import logging
 import random
 import time
 import zipfile
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum, auto
 from functools import reduce, wraps
-from typing import Any, ParamSpec, TypeVar
+from threading import RLock
+from typing import Concatenate, ParamSpec, Protocol, TypeVar
 
 import psutil
 import ray
@@ -82,18 +83,21 @@ class WorkerState:
 class Hyperparameter:
     lr: float
     batch_size: int
+    cpu_batch_size: int
 
     @classmethod
     def random(cls) -> "Hyperparameter":
         return cls(
             lr=random.uniform(0.001, 0.1),
             batch_size=random.choice([32, 64, 128, 512, 1024]),
+            cpu_batch_size=32,
         )
 
     def explore(self) -> "Hyperparameter":
         return Hyperparameter(
             self.lr * 0.8,
             self.batch_size,
+            self.cpu_batch_size,
         )
 
 
@@ -108,6 +112,12 @@ class Checkpoint:
 
     def is_empty(self) -> bool:
         return not self.model_state_dict and not self.optimizer_state_dict
+
+    def copy(self) -> "Checkpoint":
+        return Checkpoint(
+            model_state_dict=self.model_state_dict.copy(),
+            optimizer_state_dict=self.optimizer_state_dict.copy(),
+        )
 
 
 @dataclass
@@ -196,7 +206,7 @@ def unzip_file(zip_path: str, extract_to: str) -> None:
 def timing_block(
     label: str,
     logger: Callable[[str], None] | None = None,
-) -> Iterator[None]:
+) -> Generator[None]:
     start = time.perf_counter()
     yield
     end = time.perf_counter()
@@ -320,5 +330,24 @@ def rc(func: Callable[P, R]) -> Callable[P, R]:
                 trial_id,
                 self_obj.rc[trial_id],
             )
+
+    return wrapper
+
+
+class HasLock(Protocol):
+    lock: RLock
+
+
+def synchronized[T: HasLock, **P, R](
+    func: Callable[Concatenate[T, P], R],
+) -> Callable[Concatenate[T, P], R]:
+    @wraps(func)
+    def wrapper(
+        self: T,
+        *args: P.args,
+        **kwargs: P.kwargs,
+    ) -> R:
+        with self.lock:
+            return func(self, *args, **kwargs)
 
     return wrapper

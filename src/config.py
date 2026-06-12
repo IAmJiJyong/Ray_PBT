@@ -18,5 +18,5 @@ TRIAL_PROGRESS_OUTPUT_PATH: Path = Path(
         "~/Documents/Ray_PBT/trial_progress.output",
     ),
 ).expanduser()
-GPU_TRIALS_LIMIT: int = config.get("gpu_trials_limit", 3)
+GPU_TRIALS_LIMIT: int = config.get("gpu_trials_limit", 2)
 CPU_TRIALS_LIMIT: int = config.get("cpu_trials_limit", 1)

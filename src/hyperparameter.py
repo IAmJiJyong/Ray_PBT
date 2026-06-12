@@ -9,6 +9,7 @@ class CNNHyperparameter(Hyperparameter):
     lr: float
     momentum: float
     batch_size: int
+    cpu_batch_size: int
 
     def __str__(self) -> str:
         return (
@@ -22,6 +23,7 @@ class CNNHyperparameter(Hyperparameter):
             lr=random.uniform(0.001, 0.1),
             momentum=random.uniform(0.001, 1),
             batch_size=random.choice([32, 64, 128]),
+            cpu_batch_size=32,
         )
 
     def explore(self) -> "CNNHyperparameter":
@@ -38,6 +40,7 @@ class CNNHyperparameter(Hyperparameter):
             lr=lr,
             momentum=momentum,
             batch_size=self.batch_size,
+            cpu_batch_size=self.cpu_batch_size,
         )
 
 
@@ -54,6 +57,7 @@ class BertHyperparameter(Hyperparameter):
     adam_epsilon: float
     warmup_steps: int
     max_seq_length: int
+    cpu_batch_size: int
 
     def __str__(self) -> str:
         return (
@@ -69,11 +73,12 @@ class BertHyperparameter(Hyperparameter):
         """
         return cls(
             lr=random.uniform(1e-4, 1e-5),
-            batch_size=random.choice([16, 32, 64, 128]),
+            batch_size=random.choice([64, 128, 256]),
             weight_decay=random.uniform(1e-1, 1e-4),
             adam_epsilon=1e-8,
             warmup_steps=0,
             max_seq_length=128,
+            cpu_batch_size=64,
         )
 
     def explore(self) -> "BertHyperparameter":
@@ -81,12 +86,14 @@ class BertHyperparameter(Hyperparameter):
         對現有超參數進行微調探索。
         """
         new_lr = self.lr * random.choice([0.8, 1.2, 1.5])
+        new_weight_decay = self.weight_decay * random.choice([0.8, 1.2, 1.5])
 
         return BertHyperparameter(
             lr=new_lr,
             batch_size=self.batch_size,
-            weight_decay=self.weight_decay,
+            weight_decay=new_weight_decay,
             adam_epsilon=self.adam_epsilon,
             warmup_steps=self.warmup_steps,
             max_seq_length=self.max_seq_length,
+            cpu_batch_size=self.cpu_batch_size,
         )

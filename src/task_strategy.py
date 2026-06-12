@@ -44,6 +44,7 @@ class TaskStrategy(Protocol[H_contra]):
     def build_dataloaders(
         self,
         hyperparameter: H_contra,
+        device: Device,
     ) -> tuple[DataLoader, DataLoader, DataLoader]: ...
 
     def train_step(
@@ -115,11 +116,16 @@ class BertSST2Task(TaskStrategy[BertHyperparameter]):
     def build_dataloaders(
         self,
         hyperparameter: BertHyperparameter,
+        device: Device,
     ) -> tuple[DataLoader, DataLoader, DataLoader]:
         data_dir: Path = Path(
             "~/Documents/workspace/tune_population_based/data",
         ).expanduser()
-        batch_size = hyperparameter.batch_size
+
+        if (device.type) == "cpu":
+            batch_size = hyperparameter.cpu_batch_size
+        else:
+            batch_size = hyperparameter.batch_size
 
         tokenizer = AutoTokenizer.from_pretrained("google/mobilebert-uncased")
         dataset = load_dataset("glue", "sst2", cache_dir=str(data_dir))
@@ -163,8 +169,7 @@ class BertSST2Task(TaskStrategy[BertHyperparameter]):
         device: Device,
     ) -> None:
         model.train()
-        # for raw_batch in islice(dataloader, 50):
-        for raw_batch in dataloader:
+        for raw_batch in islice(dataloader, 30):
             batch = {k: v.to(device) for k, v in raw_batch.items()}
             optimizer.zero_grad()
             outputs = model(**batch)
@@ -243,6 +248,7 @@ class ResNet18Cifar10Task(TaskStrategy[CNNHyperparameter]):
     def build_dataloaders(
         self,
         hyperparameter: CNNHyperparameter,
+        device: Device,
     ) -> tuple[DataLoader, DataLoader, DataLoader]:
         data_dir = Path(DATASET_PATH).expanduser()
         if not Path(data_dir).exists():
@@ -292,14 +298,19 @@ class ResNet18Cifar10Task(TaskStrategy[CNNHyperparameter]):
             transform=test_transform,
         )
 
+        if (device.type) == "cpu":
+            batch_size = hyperparameter.cpu_batch_size
+        else:
+            batch_size = hyperparameter.batch_size
+
         train_loader = DataLoader(
             train_dataset,
-            batch_size=hyperparameter.batch_size,
+            batch_size=batch_size,
             shuffle=True,
         )
         valid_loader = DataLoader(
             test_dataset,
-            batch_size=hyperparameter.batch_size,
+            batch_size=batch_size,
             shuffle=False,
         )
 
@@ -403,6 +414,7 @@ class ResNet50CIFAR100Task(TaskStrategy[CNNHyperparameter]):
     def build_dataloaders(
         self,
         hyperparameter: CNNHyperparameter,
+        device: Device,
     ) -> tuple[DataLoader, DataLoader, DataLoader]:
         data_dir = Path(DATASET_PATH).expanduser()
         if not (Path(data_dir) / "cifar-100-python").exists():
@@ -452,15 +464,20 @@ class ResNet50CIFAR100Task(TaskStrategy[CNNHyperparameter]):
             transform=test_transform,
         )
 
+        if (device.type) == "cpu":
+            batch_size = hyperparameter.cpu_batch_size
+        else:
+            batch_size = hyperparameter.batch_size
+
         train_loader = DataLoader(
             train_dataset,
-            batch_size=hyperparameter.batch_size,
+            batch_size=batch_size,
             shuffle=True,
         )
 
         valid_loader = DataLoader(
             test_dataset,
-            batch_size=hyperparameter.batch_size,
+            batch_size=batch_size,
             shuffle=False,
         )
 

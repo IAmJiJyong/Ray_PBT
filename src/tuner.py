@@ -67,13 +67,14 @@ class Tuner:
 
         self.start_time: float = time.time()
         self.tb_manager = TensorBoardManager.options(
-            max_concurrency=10,
+            # max_concurrency=10,
             num_cpus=1,
             resources={f"node:{get_head_node_address()}": 0.01},
         ).remote(runs_dir, len(trial_states), self.start_time)
 
         self.trial_manager: ActorHandle = TrialManager.options(
             num_cpus=1,
+            max_concurrency=4,
             resources={f"node:{get_head_node_address()}": 0.01},
         ).remote(trial_states, self.tb_manager)  # type: ignore[reportGeneralTypeIssues]
 
@@ -102,6 +103,7 @@ class Tuner:
         self.logger.info("訓練總時長: %.2f 秒", end - self.start_time)
         self.logger.info("Assign: %d", self.worker_manager.assign_count["assign"])
         self.logger.info("Locality: %d", self.worker_manager.assign_count["locality"])
+        ray.get(self.trial_manager.close.remote())  # type: ignore[]
 
     def on_trial_complete(
         self,
