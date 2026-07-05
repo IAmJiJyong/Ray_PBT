@@ -44,7 +44,7 @@ if __name__ == "__main__":
             ],
         },
     )
-    trial_states = generate_trial_states(BertHyperparameter, trial_num)
+    trial_states = generate_trial_states(CNNHyperparameter, trial_num)
 
     timestamp = (datetime.now(UTC) + timedelta(hours=8)).strftime("%Y-%m-%d_%H-%M-%S")
 
@@ -54,14 +54,16 @@ if __name__ == "__main__":
         resources={f"node:{get_head_node_address()}": 0.01},
     ).remote(
         trial_states,
-        BertSST2Task(),
+        ResNet50CIFAR100Task(),
         Path(f"./runs/BERT/Trial{trial_num}/{timestamp}").resolve(),
     )
 
     ray.get(tuner.run.remote())  # type: ignore[call-arg]
 
     zip_logs_bytes: bytes = ray.get(tuner.get_zipped_log.remote())  # type: ignore[call-arg]
-    zip_output_dir = Path("./logs") / "BERT" / f"Trial{trial_num}" / timestamp
+    zip_output_dir = (
+        Path("./logs") / "BERT-NoStealing" / f"Trial{trial_num}" / timestamp
+    )
 
     zip_output_dir.mkdir(parents=True, exist_ok=True)
     zip_output_path = Path(zip_output_dir) / "logs.zip"

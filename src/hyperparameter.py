@@ -72,7 +72,7 @@ class BertHyperparameter(Hyperparameter):
         為 BERT 微調任務生成一組典型的隨機超參數。
         """
         return cls(
-            lr=random.uniform(1e-4, 1e-5),
+            lr=random.uniform(1e-5, 5e-4),
             batch_size=random.choice([64, 128, 256]),
             weight_decay=random.uniform(1e-1, 1e-4),
             adam_epsilon=1e-8,
@@ -85,12 +85,13 @@ class BertHyperparameter(Hyperparameter):
         """
         對現有超參數進行微調探索。
         """
-        new_lr = self.lr * random.choice([0.8, 1.2, 1.5])
-        new_weight_decay = self.weight_decay * random.choice([0.8, 1.2, 1.5])
+        new_lr = self.lr * random.choice([0.8, 1.2])
+        new_weight_decay = self.weight_decay * random.choice([0.8, 1.2])
+        new_batch_size = random.choice([64, 128, 256])
 
         return BertHyperparameter(
             lr=new_lr,
-            batch_size=self.batch_size,
+            batch_size=new_batch_size,
             weight_decay=new_weight_decay,
             adam_epsilon=self.adam_epsilon,
             warmup_steps=self.warmup_steps,

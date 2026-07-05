@@ -169,7 +169,7 @@ class BertSST2Task(TaskStrategy[BertHyperparameter]):
         device: Device,
     ) -> None:
         model.train()
-        for raw_batch in islice(dataloader, 30):
+        for raw_batch in islice(dataloader, 50):
             batch = {k: v.to(device) for k, v in raw_batch.items()}
             optimizer.zero_grad()
             outputs = model(**batch)

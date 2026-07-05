@@ -324,8 +324,6 @@ class Worker:
                 self.device,
             )
 
-            with self.lock:
-                self.active_trials.pop(trial_state.id)
             self.train(trial_state, model, optimizer, train_loader, test_loader)
             torch.cuda.empty_cache()
 
@@ -399,7 +397,10 @@ class Worker:
             trial_state.accuracy >= trial_state.stop_accuracy
             or trial_state.generation >= trial_state.max_generation
         ):
+            if trial_state.id in self.interrupt_set:
+                return
             trial_state.update_checkpoint(model, optimizer)
+            self.active_trials.pop(trial_state.id)
             ray.get(
                 self.tuner.on_trial_complete.remote(  # type:ignore[]
                     worker_id=self.worker_state.id,
@@ -425,6 +426,7 @@ class Worker:
                 trial_id=trial_state.id,
             )
             trial_state.update_checkpoint(model, optimizer)
+            self.active_trials.pop(trial_state.id)
             ray.get(
                 self.tuner.on_trial_need_mutation.remote(  # type:ignore[]
                     worker_id=self.worker_state.id,
@@ -454,6 +456,7 @@ class Worker:
 
         # ── 目標世代數已達成, 更新檢查點並回報結果 ────────────────────────────
         trial_state.update_checkpoint(model, optimizer)
+        self.active_trials.pop(trial_state.id)
         ray.get(
             self.tuner.on_trial_step_complete.remote(  # type:ignore[]
                 worker_id=self.worker_state.id,

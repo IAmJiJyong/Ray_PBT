@@ -79,7 +79,11 @@ class TrialManager:
         self.waiting_ids: set[int] = set()
         self.failed_ids: set[int] = set()
 
-        self.history_best: TrialState | None = None
+        self.history_best: dict = {
+            "accuracy": 0,
+            "checkpoint": None,
+            "hyperparameter": None,
+        }
         self.worker_states: list[WorkerState] = []
 
         self.tb_manager = tensorboard_manager
@@ -360,8 +364,8 @@ class TrialManager:
         target_generation = sum(generations[:length]) // length - generation + 1
         return max(target_generation, 1)
 
-    def get_history_best_result(self) -> TrialState | None:
-        return self.history_best
+    # def get_history_best_result(self) -> TrialState | None:
+    #     return self.history_best
 
     def get_nlargest_iteration_trials(self, k: int) -> list[TrialState]:
         return heapq.nlargest(
@@ -466,28 +470,24 @@ class TrialManager:
 
         if "accuracy" in partial:
             if trial_state.accuracy > 0 and (
-                self.history_best is None
-                or trial_state.accuracy > self.history_best.accuracy
+                trial_state.accuracy > self.history_best["accuracy"]
             ):
-                self.history_best = trial_state
+                self.history_best["accuracy"] = trial_state.accuracy
+                self.history_best["checkpoint"] = trial_state.checkpoint
+                self.history_best["hyperparameter"] = trial_state.hyperparameter
+                self.history_best["generation"] = trial_state.generation
 
             if self.history_best:
                 self.logger.info(
                     "History best accuracy: %f, %s, iteration: %d",
-                    self.history_best.accuracy,
-                    str(self.history_best.hyperparameter),
-                    self.history_best.generation,
-                )
-
-                self.tb_manager.add_best_acc_to_global.remote(
-                    self.history_best.accuracy,
-                    time.time(),
+                    self.history_best["accuracy"],
+                    str(self.history_best["hyperparameter"]),
+                    self.history_best["generation"],
                 )
 
             self.maybe_update_mutation_baseline()
 
         self._display_event.set()
-        # self.display_trial_result()
 
     def is_finish(self) -> bool:
         total_finished = len(self.completed_ids) + len(self.failed_ids)
