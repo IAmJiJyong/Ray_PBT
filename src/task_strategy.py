@@ -1,14 +1,19 @@
 from itertools import islice
 from pathlib import Path
-from typing import Any, Protocol, TypeVar, cast
+from typing import Protocol, TypeVar, cast
 
 import torch
-from datasets import load_from_disk, logging
-from torch import device, nn, no_grad, optim
+from datasets import load_dataset, logging
+from torch import nn, no_grad, optim
+from torch.types import Device
 from torch.utils.data import DataLoader
 from torchvision import models, transforms
 from torchvision.datasets import CIFAR10, CIFAR100
-from transformers import AutoConfig, AutoModelForSequenceClassification, AutoTokenizer
+from transformers import (
+    AutoTokenizer,
+    DataCollatorWithPadding,
+    MobileBertForSequenceClassification,
+)
 
 from .config import DATASET_PATH
 from .hyperparameter import BertHyperparameter, CNNHyperparameter, Hyperparameter
@@ -25,7 +30,7 @@ class TaskStrategy(Protocol[H_contra]):
         self,
         hyperparameter: H_contra,
         checkpoint: Checkpoint,
-        device: device,
+        device: Device,
     ) -> nn.Module: ...
 
     def build_optimizer(
@@ -33,12 +38,13 @@ class TaskStrategy(Protocol[H_contra]):
         model: nn.Module,
         hyperparameter: H_contra,
         checkpoint: Checkpoint,
-        device: device,
+        device: Device,
     ) -> optim.Optimizer: ...
 
     def build_dataloaders(
         self,
         hyperparameter: H_contra,
+        device: Device,
     ) -> tuple[DataLoader, DataLoader, DataLoader]: ...
 
     def train_step(
@@ -46,14 +52,14 @@ class TaskStrategy(Protocol[H_contra]):
         model: nn.Module,
         optimizer: optim.Optimizer,
         dataloader: DataLoader,
-        device: device,
+        device: Device,
     ) -> None: ...
 
     def evaluate(
         self,
         model: nn.Module,
         dataloader: DataLoader,
-        device: device,
+        device: Device,
     ) -> float: ...
 
 
@@ -62,15 +68,11 @@ class BertSST2Task(TaskStrategy[BertHyperparameter]):
         self,
         hyperparameter: BertHyperparameter,
         checkpoint: Checkpoint,
-        device: device,
+        device: Device,
     ) -> nn.Module:
-        model_name: str = "google/mobilebert-uncased"
-        num_labels: int = 2
-
-        config = AutoConfig.from_pretrained(model_name, num_labels=num_labels)
-        model = AutoModelForSequenceClassification.from_pretrained(
-            model_name,
-            config=config,
+        model = MobileBertForSequenceClassification.from_pretrained(
+            "google/mobilebert-uncased",
+            num_labels=2,
         )
 
         if checkpoint.is_empty():
@@ -87,7 +89,7 @@ class BertSST2Task(TaskStrategy[BertHyperparameter]):
         model: nn.Module,
         hyperparameter: BertHyperparameter,
         checkpoint: Checkpoint,
-        device: device,
+        device: Device,
     ) -> optim.Optimizer:
         hyperparameter = cast("BertHyperparameter", hyperparameter)
 
@@ -114,67 +116,60 @@ class BertSST2Task(TaskStrategy[BertHyperparameter]):
     def build_dataloaders(
         self,
         hyperparameter: BertHyperparameter,
+        device: Device,
     ) -> tuple[DataLoader, DataLoader, DataLoader]:
-        hyperparameter = cast("BertHyperparameter", hyperparameter)
+        data_dir: Path = Path(
+            "~/Documents/workspace/tune_population_based/data",
+        ).expanduser()
 
-        dataset = load_from_disk(
-            str(Path("~/Documents/hf_cache/sst2_arrow").expanduser()),
-        )
+        if (device.type) == "cpu":
+            batch_size = hyperparameter.cpu_batch_size
+        else:
+            batch_size = hyperparameter.batch_size
 
-        tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
+        tokenizer = AutoTokenizer.from_pretrained("google/mobilebert-uncased")
+        dataset = load_dataset("glue", "sst2", cache_dir=str(data_dir))
 
-        def tokenize_fn(batch: dict) -> dict[str, Any]:
-            return tokenizer(
-                batch["sentence"],
-                padding="max_length",
+        tokenized_datasets = dataset.map(
+            lambda exam: tokenizer(
+                exam["sentence"],
                 truncation=True,
-                max_length=hyperparameter.max_seq_length,
-            )
-
-        dataset = dataset.map(
-            tokenize_fn,
+                max_length=128,
+            ),
             batched=True,
-            remove_columns=["sentence", "idx"],
         )
+        tokenized_datasets = tokenized_datasets.remove_columns(["sentence", "idx"])
+        tokenized_datasets = tokenized_datasets.rename_column("label", "labels")
+        tokenized_datasets.set_format("torch")
 
-        dataset = dataset.rename_column("label", "labels")
-        dataset.set_format(  # type: ignore[]
-            type="torch",
-            columns=["input_ids", "attention_mask", "labels"],
-        )
+        data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
 
         train_loader = DataLoader(
-            dataset["train"],  # type:ignore[]
-            batch_size=hyperparameter.batch_size,
+            tokenized_datasets["train"],
             shuffle=True,
-            pin_memory=False,
-        )
-
-        valid_loader = DataLoader(
-            dataset["validation"],  # type:ignore[]
-            batch_size=hyperparameter.batch_size,
-            shuffle=False,
-            pin_memory=False,
+            batch_size=batch_size,
+            collate_fn=data_collator,
+            pin_memory=True,  # 針對 GPU 加速資料搬運
         )
 
         test_loader = DataLoader(
-            dataset["test"],  # type:ignore[]
-            batch_size=hyperparameter.batch_size,
-            shuffle=False,
-            pin_memory=False,
+            tokenized_datasets["validation"],
+            batch_size=batch_size,
+            collate_fn=data_collator,
+            pin_memory=True,  # 針對 GPU 加速資料搬運
         )
 
-        return train_loader, valid_loader, test_loader
+        return train_loader, test_loader, None
 
     def train_step(
         self,
         model: nn.Module,
         optimizer: optim.Optimizer,
         dataloader: DataLoader,
-        device: device,
+        device: Device,
     ) -> None:
         model.train()
-        for raw_batch in islice(dataloader, 8):
+        for raw_batch in islice(dataloader, 50):
             batch = {k: v.to(device) for k, v in raw_batch.items()}
             optimizer.zero_grad()
             outputs = model(**batch)
@@ -187,7 +182,7 @@ class BertSST2Task(TaskStrategy[BertHyperparameter]):
         self,
         model: nn.Module,
         dataloader: DataLoader,
-        device: device,
+        device: Device,
     ) -> float:
         model.eval()
 
@@ -210,7 +205,7 @@ class ResNet18Cifar10Task(TaskStrategy[CNNHyperparameter]):
         self,
         hyperparameter: CNNHyperparameter,
         checkpoint: Checkpoint,
-        device: device,
+        device: Device,
     ) -> nn.Module:
         model = models.resnet18()
         model.fc = nn.Linear(model.fc.in_features, 10)
@@ -228,7 +223,7 @@ class ResNet18Cifar10Task(TaskStrategy[CNNHyperparameter]):
         model: nn.Module,
         hyperparameter: CNNHyperparameter,
         checkpoint: Checkpoint,
-        device: device,
+        device: Device,
     ) -> optim.Optimizer:
         if checkpoint.is_empty():
             return optim.SGD(
@@ -253,6 +248,7 @@ class ResNet18Cifar10Task(TaskStrategy[CNNHyperparameter]):
     def build_dataloaders(
         self,
         hyperparameter: CNNHyperparameter,
+        device: Device,
     ) -> tuple[DataLoader, DataLoader, DataLoader]:
         data_dir = Path(DATASET_PATH).expanduser()
         if not Path(data_dir).exists():
@@ -302,14 +298,19 @@ class ResNet18Cifar10Task(TaskStrategy[CNNHyperparameter]):
             transform=test_transform,
         )
 
+        if (device.type) == "cpu":
+            batch_size = hyperparameter.cpu_batch_size
+        else:
+            batch_size = hyperparameter.batch_size
+
         train_loader = DataLoader(
             train_dataset,
-            batch_size=hyperparameter.batch_size,
+            batch_size=batch_size,
             shuffle=True,
         )
         valid_loader = DataLoader(
             test_dataset,
-            batch_size=hyperparameter.batch_size,
+            batch_size=batch_size,
             shuffle=False,
         )
 
@@ -320,7 +321,7 @@ class ResNet18Cifar10Task(TaskStrategy[CNNHyperparameter]):
         model: nn.Module,
         optimizer: optim.Optimizer,
         dataloader: DataLoader,
-        device: device,
+        device: Device,
     ) -> None:
         model.train()
         criterion = nn.CrossEntropyLoss().to(device)
@@ -337,7 +338,7 @@ class ResNet18Cifar10Task(TaskStrategy[CNNHyperparameter]):
         self,
         model: nn.Module,
         dataloader: DataLoader,
-        device: device,
+        device: Device,
     ) -> float:
         model.eval()
         total = 0
@@ -361,7 +362,7 @@ class ResNet50CIFAR100Task(TaskStrategy[CNNHyperparameter]):
         self,
         hyperparameter: CNNHyperparameter,
         checkpoint: Checkpoint,
-        device: device,
+        device: Device,
     ) -> nn.Module:
         model = models.resnet50(num_classes=100)
         model.conv1 = nn.Conv2d(
@@ -388,7 +389,7 @@ class ResNet50CIFAR100Task(TaskStrategy[CNNHyperparameter]):
         model: nn.Module,
         hyperparameter: CNNHyperparameter,
         checkpoint: Checkpoint,
-        device: device,
+        device: Device,
     ) -> optim.Optimizer:
         if checkpoint.is_empty():
             return optim.SGD(
@@ -413,6 +414,7 @@ class ResNet50CIFAR100Task(TaskStrategy[CNNHyperparameter]):
     def build_dataloaders(
         self,
         hyperparameter: CNNHyperparameter,
+        device: Device,
     ) -> tuple[DataLoader, DataLoader, DataLoader]:
         data_dir = Path(DATASET_PATH).expanduser()
         if not (Path(data_dir) / "cifar-100-python").exists():
@@ -462,14 +464,20 @@ class ResNet50CIFAR100Task(TaskStrategy[CNNHyperparameter]):
             transform=test_transform,
         )
 
+        if (device.type) == "cpu":
+            batch_size = hyperparameter.cpu_batch_size
+        else:
+            batch_size = hyperparameter.batch_size
+
         train_loader = DataLoader(
             train_dataset,
-            batch_size=hyperparameter.batch_size,
+            batch_size=batch_size,
             shuffle=True,
         )
+
         valid_loader = DataLoader(
             test_dataset,
-            batch_size=hyperparameter.batch_size,
+            batch_size=batch_size,
             shuffle=False,
         )
 
@@ -480,12 +488,12 @@ class ResNet50CIFAR100Task(TaskStrategy[CNNHyperparameter]):
         model: nn.Module,
         optimizer: optim.Optimizer,
         dataloader: DataLoader,
-        device: device,
+        device: Device,
     ) -> None:
         model.train()
         criterion = nn.CrossEntropyLoss().to(device)
 
-        for raw_inputs, raw_targets in dataloader:
+        for raw_inputs, raw_targets in islice(dataloader, 30):
             inputs, targets = raw_inputs.to(device), raw_targets.to(device)
             optimizer.zero_grad()
             outputs = model(inputs)
@@ -497,7 +505,7 @@ class ResNet50CIFAR100Task(TaskStrategy[CNNHyperparameter]):
         self,
         model: nn.Module,
         dataloader: DataLoader,
-        device: device,
+        device: Device,
     ) -> float:
         model.eval()
         total = 0
@@ -512,159 +520,5 @@ class ResNet50CIFAR100Task(TaskStrategy[CNNHyperparameter]):
                 _, predicted = outputs.max(1)
                 total += targets.size(0)
                 correct += predicted.eq(targets).sum().item()
-
-        return correct / total
-
-
-class MobileViTTinyImageNetStrategy:
-    def __init__(self) -> None:
-        self.data_root = ""
-        self.num_classes = 200
-
-    # -------------------------
-    # Model
-    # -------------------------
-    def build_model(
-        self,
-        hyperparameter: HyperParameter,
-        checkpoint,
-        device: torch.device,
-    ) -> nn.Module:
-
-        model = timm.create_model(
-            hyperparameter.model_name,
-            pretrained=True,
-            num_classes=self.num_classes,
-        )
-
-        model = model.to(device)
-
-        # load checkpoint (for PBT / resuming)
-        if checkpoint is not None and "model" in checkpoint:
-            model.load_state_dict(checkpoint["model"])
-
-        return model
-
-    # -------------------------
-    # Optimizer
-    # -------------------------
-    def build_optimizer(
-        self,
-        model: nn.Module,
-        hyperparameter: HyperParameter,
-        checkpoint: Checkpoint,
-        device: torch.device,
-    ) -> optim.Optimizer:
-
-        optimizer = optim.AdamW(model.parameters(), lr=hyperparameter.lr)
-
-        if checkpoint is not None and "optimizer" in checkpoint:
-            optimizer.load_state_dict(checkpoint["optimizer"])
-
-        return optimizer
-
-    # -------------------------
-    # Dataloader
-    # -------------------------
-    def build_dataloaders(
-        self,
-        hyperparameter: HyperParameter,
-    ) -> tuple[DataLoader, DataLoader, DataLoader]:
-
-        transform = transforms.Compose(
-            [
-                transforms.Resize((224, 224)),
-                transforms.ToTensor(),
-                transforms.Normalize(
-                    mean=[0.485, 0.456, 0.406],
-                    std=[0.229, 0.224, 0.225],
-                ),
-            ]
-        )
-
-        train_dataset = datasets.ImageFolder(
-            root=f"{self.data_root}/train",
-            transform=transform,
-        )
-
-        val_dataset = datasets.ImageFolder(
-            root=f"{self.data_root}/val",
-            transform=transform,
-        )
-
-        test_dataset = datasets.ImageFolder(
-            root=f"{self.data_root}/val",  # TinyImageNet test通常無label
-            transform=transform,
-        )
-
-        train_loader = DataLoader(
-            train_dataset,
-            batch_size=hyperparameter.batch_size,
-            shuffle=True,
-            # num_workers=4,
-            pin_memory=True,
-        )
-
-        val_loader = DataLoader(
-            val_dataset,
-            batch_size=hyperparameter.batch_size,
-            shuffle=False,
-            num_workers=4,
-        )
-
-        test_loader = DataLoader(
-            test_dataset,
-            batch_size=hyperparameter.batch_size,
-            shuffle=False,
-            num_workers=4,
-        )
-
-        return train_loader, val_loader, test_loader
-
-    # -------------------------
-    # Train step
-    # -------------------------
-    def train_step(
-        self,
-        model: nn.Module,
-        optimizer: optim.Optimizer,
-        dataloader: DataLoader,
-        device: device,
-    ) -> None:
-        model.train()
-        criterion = nn.CrossEntropyLoss()
-
-        for raw_images, raw_labels in dataloader:
-            images = raw_images.to(device)
-            labels = raw_labels.to(device)
-
-            logits = model(images)
-            loss = criterion(logits, labels)
-
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-    def evaluate(
-        self,
-        model: nn.Module,
-        dataloader: DataLoader,
-        device: device,
-    ) -> float:
-
-        model.eval()
-        correct = 0
-        total = 0
-
-        with torch.no_grad():
-            for raw_images, raw_labels in dataloader:
-                images = raw_images.to(device)
-                labels = raw_labels.to(device)
-
-                logits = model(images)
-                preds = logits.argmax(dim=1)
-
-                correct += (preds == labels).sum().item()
-                total += labels.size(0)
 
         return correct / total

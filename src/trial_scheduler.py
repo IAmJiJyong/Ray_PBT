@@ -235,7 +235,7 @@ class TrialScheduler:
 
         self.trial_manager.print_iteration_count.remote()
         self.logger.info("🎉 所有 Trial 訓練完成!")
-        self.worker_manager.stop_all_workers()
+        # self.worker_manager.stop_all_workers()
 
     def finish(self) -> None:
         self._finish_event.set()

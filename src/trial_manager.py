@@ -2,26 +2,37 @@ import heapq
 import logging
 import math
 import random
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from threading import Event, RLock, Thread
 
 import ray
+from ray.actor import ActorHandle
 
 from .config import (
+    ENABLE_CHECKPOINT_LOCALITY,
     TRIAL_PROGRESS_OUTPUT_PATH,
 )
 from .trial_state import PartialTrialState, TrialState
-from .utils import TrialStatus, WorkerState, WorkerType, colored_progress_bar
+from .utils import (
+    TrialStatus,
+    WorkerState,
+    WorkerType,
+    colored_progress_bar,
+    synchronized,
+)
 
 ALLOWED_TRANSITION: dict[TrialStatus, set[TrialStatus]] = {
-    TrialStatus.PENDING: {TrialStatus.WAITING},
-    TrialStatus.WAITING: {TrialStatus.RUNNING, TrialStatus.PENDING},
+    TrialStatus.PENDING: {TrialStatus.WAITING, TrialStatus.FAILED},
+    TrialStatus.WAITING: {TrialStatus.RUNNING, TrialStatus.PENDING, TrialStatus.FAILED},
     TrialStatus.RUNNING: {
-        TrialStatus.WAITING,
         TrialStatus.PENDING,
         TrialStatus.TERMINATED,
+        TrialStatus.FAILED,
     },
     TrialStatus.TERMINATED: set(),
+    TrialStatus.FAILED: {TrialStatus.PENDING},
 }
 
 
@@ -40,7 +51,7 @@ def get_trial_manager_logger() -> logging.Logger:
         )
 
         stream_handler = logging.StreamHandler()
-        stream_handler.setLevel(logging.INFO)  # 只顯示 INFO 級別以上的訊息
+        stream_handler.setLevel(logging.DEBUG)  # 只顯示 INFO 級別以上的訊息
         stream_handler.setFormatter(formatter)
         logger.addHandler(stream_handler)
 
@@ -57,99 +68,152 @@ class TrialManager:
     def __init__(
         self,
         trial_states: list[TrialState],
+        tensorboard_manager: ActorHandle,
     ) -> None:
+        self.lock: RLock = RLock()
+        self.trial_locks: list[RLock] = [RLock() for _ in range(len(trial_states))]
+
         self.all_trials = {trial.id: trial for trial in trial_states}
         self.pending_ids = {trial.id for trial in trial_states}
-        self.running_ids = set()
-        self.completed_ids = set()
-        self.waiting_ids = set()
-        self.history_best: TrialState | None = None
+        self.running_ids: set[int] = set()
+        self.completed_ids: set[int] = set()
+        self.waiting_ids: set[int] = set()
+        self.failed_ids: set[int] = set()
+
+        self.history_best: dict = {
+            "accuracy": 0,
+            "checkpoint": None,
+            "hyperparameter": None,
+        }
         self.worker_states: list[WorkerState] = []
 
+        self.tb_manager = tensorboard_manager
         self._mutation_baseline: float = 0.0
         self._upper_quantile_trials: list[TrialState] = []
         self.logger = get_trial_manager_logger()
+
+        self._display_event = Event()
+        self._stop_display = False
+        self._display_thread = Thread(target=self._display_loop, daemon=True)
+        self._display_thread.start()
+
+    def _remove_from_status_sets(self, trial_id: int) -> None:
+        with self.trial_locks[trial_id]:
+            self.pending_ids.discard(trial_id)
+            self.running_ids.discard(trial_id)
+            self.waiting_ids.discard(trial_id)
+            self.completed_ids.discard(trial_id)
+            self.failed_ids.discard(trial_id)
 
     def set_worker_states(self, worker_states: list[WorkerState]) -> None:
         self.worker_states = worker_states
 
     def _get_trial_or_raise(self, trial_id: int) -> TrialState:
-        trial = self.all_trials.get(trial_id)
-        if trial is None:
-            msg = f"Trial {trial_id} not found"
-            raise ValueError(msg)
-        return trial
+        with self.trial_locks[trial_id]:
+            trial = self.all_trials.get(trial_id)
+            if trial is None:
+                msg = f"Trial {trial_id} not found"
+                raise ValueError(msg)
+            return trial
 
     def _set_status(self, trial_id: int, new_status: TrialStatus) -> None:
-        trial_state = self._get_trial_or_raise(trial_id)
-        old_status = self.all_trials[trial_id].status
+        with self.trial_locks[trial_id]:
+            trial_state = self._get_trial_or_raise(trial_id)
+            old_status = self.all_trials[trial_id].status
 
-        allowed = ALLOWED_TRANSITION[old_status]
-        if new_status not in allowed:
-            msg = (
-                f"Trial {trial_id} 錯誤的狀態轉移: "
-                f"{old_status} -> {new_status}(僅允許: {allowed})"
+            if old_status == new_status:
+                return
+
+            allowed = ALLOWED_TRANSITION[old_status]
+            if new_status not in allowed:
+                msg = (
+                    f"Trial {trial_id} 錯誤的狀態轉移: "
+                    f"{old_status} -> {new_status}(僅允許: {allowed})"
+                )
+                raise ValueError(msg)
+
+            trial_state.status = new_status
+            self.logger.info(
+                "Trial %d 狀態從 %s -> %s",
+                trial_id,
+                old_status,
+                new_status,
             )
-            raise ValueError(msg)
-
-        trial_state.status = new_status
-        self.logger.info("Trial %d 狀態從 %s -> %s", trial_id, old_status, new_status)
 
     def _transition_to_waiting(
         self,
         trial_id: int,
         partial: PartialTrialState | None = None,
     ) -> None:
-        self._get_trial_or_raise(trial_id)
+        with self.trial_locks[trial_id]:
+            self._get_trial_or_raise(trial_id)
 
-        if partial:
-            self.update_trial(trial_id, partial)
+            if partial:
+                self.update_trial(trial_id, partial)
 
-        self._set_status(trial_id, TrialStatus.WAITING)
-        self.pending_ids.discard(trial_id)
-        self.waiting_ids.add(trial_id)
+            self._set_status(trial_id, TrialStatus.WAITING)
+            self._remove_from_status_sets(trial_id)
+            self.waiting_ids.add(trial_id)
 
     def _transition_to_running(
         self,
         trial_id: int,
         partial: PartialTrialState | None = None,
     ) -> None:
-        self._get_trial_or_raise(trial_id)
+        with self.trial_locks[trial_id]:
+            self._get_trial_or_raise(trial_id)
 
-        if partial:
-            self.update_trial(trial_id, partial)
+            if partial:
+                self.update_trial(trial_id, partial)
 
-        self._set_status(trial_id, TrialStatus.RUNNING)
-        self.waiting_ids.discard(trial_id)
-        self.running_ids.add(trial_id)
+            self._set_status(trial_id, TrialStatus.RUNNING)
+            self._remove_from_status_sets(trial_id)
+            self.running_ids.add(trial_id)
 
     def _transition_to_pending(
         self,
         trial_id: int,
         partial: PartialTrialState | None = None,
     ) -> None:
-        self._get_trial_or_raise(trial_id)
+        with self.trial_locks[trial_id]:
+            self._get_trial_or_raise(trial_id)
 
-        if partial:
-            self.update_trial(trial_id, partial)
+            if partial:
+                self.update_trial(trial_id, partial)
 
-        self._set_status(trial_id, TrialStatus.PENDING)
-        self.running_ids.discard(trial_id)
-        self.pending_ids.add(trial_id)
+            self._set_status(trial_id, TrialStatus.PENDING)
+            self._remove_from_status_sets(trial_id)
+            self.pending_ids.add(trial_id)
 
     def _transition_to_completed(
         self,
         trial_id: int,
         partial: PartialTrialState | None = None,
     ) -> None:
-        self._get_trial_or_raise(trial_id)
+        with self.trial_locks[trial_id]:
+            self._get_trial_or_raise(trial_id)
 
-        if partial:
-            self.update_trial(trial_id, partial)
+            if partial:
+                self.update_trial(trial_id, partial)
 
-        self._set_status(trial_id, TrialStatus.TERMINATED)
-        self.running_ids.discard(trial_id)
-        self.completed_ids.add(trial_id)
+            self._set_status(trial_id, TrialStatus.TERMINATED)
+            self._remove_from_status_sets(trial_id)
+            self.completed_ids.add(trial_id)
+
+    def _transition_to_failed(
+        self,
+        trial_id: int,
+        partial: PartialTrialState | None = None,
+    ) -> None:
+        with self.trial_locks[trial_id]:
+            self._get_trial_or_raise(trial_id)
+
+            if partial:
+                self.update_trial(trial_id, partial)
+
+            self._set_status(trial_id, TrialStatus.FAILED)
+            self._remove_from_status_sets(trial_id)
+            self.failed_ids.add(trial_id)
 
     def transition_status(
         self,
@@ -157,19 +221,23 @@ class TrialManager:
         status: TrialStatus,
         partial: PartialTrialState | None = None,
     ) -> None:
-        match status:
-            case TrialStatus.PENDING:
-                self._transition_to_pending(trial_id, partial)
-            case TrialStatus.WAITING:
-                self._transition_to_waiting(trial_id, partial)
-            case TrialStatus.RUNNING:
-                self._transition_to_running(trial_id, partial)
-            case TrialStatus.TERMINATED:
-                self._transition_to_completed(trial_id, partial)
-            case _:
-                msg = f"Unknown status: {status}"
-                raise ValueError(msg)
+        with self.trial_locks[trial_id]:
+            match status:
+                case TrialStatus.PENDING:
+                    self._transition_to_pending(trial_id, partial)
+                case TrialStatus.WAITING:
+                    self._transition_to_waiting(trial_id, partial)
+                case TrialStatus.RUNNING:
+                    self._transition_to_running(trial_id, partial)
+                case TrialStatus.TERMINATED:
+                    self._transition_to_completed(trial_id, partial)
+                case TrialStatus.FAILED:
+                    self._transition_to_failed(trial_id, partial)
+                case _:
+                    msg = f"Unknown status: {status}"
+                    raise ValueError(msg)
 
+    @synchronized
     def acquire_pending_trials(
         self,
         worker_id: int,
@@ -188,6 +256,7 @@ class TrialManager:
 
         return acquired
 
+    @synchronized
     def acquire_pending_trial_for_gpu(
         self,
         worker_id: int,
@@ -203,7 +272,8 @@ class TrialManager:
         potential_trials = [
             t
             for t in trials
-            if not t.last_checkpoint_location.is_empty()
+            if ENABLE_CHECKPOINT_LOCALITY
+            and not t.last_checkpoint_location.is_empty()
             and t.last_checkpoint_location.worker_id == worker_id
         ]
 
@@ -234,6 +304,7 @@ class TrialManager:
 
         return current_trial_state
 
+    @synchronized
     def acquire_pending_trial_for_cpu(
         self,
         worker_id: int,
@@ -251,9 +322,11 @@ class TrialManager:
 
         return selected_trial
 
+    @synchronized
     def get_pending_trials(self) -> list[TrialState]:
         return [self.all_trials[tid] for tid in self.pending_ids]
 
+    @synchronized
     def get_pending_trials_with_min_iteration(self) -> list[TrialState]:
         if not self.pending_ids:
             return []
@@ -262,6 +335,7 @@ class TrialManager:
         min_iter = min(pending_trials, key=lambda t: t.generation).generation
         return [trial for trial in pending_trials if trial.generation == min_iter]
 
+    @synchronized
     def get_least_iterated_pending_trial(self) -> TrialState | None:
         if not self.pending_ids:
             return None
@@ -272,6 +346,7 @@ class TrialManager:
             default=None,
         )
 
+    @synchronized
     def get_most_iterated_pending_trial(self) -> TrialState | None:
         if not self.pending_ids:
             return None
@@ -289,10 +364,10 @@ class TrialManager:
         )
         length = (len(generations) // 4) + 1
         target_generation = sum(generations[:length]) // length - generation + 1
-        return max(target_generation, 1)
+        return max(target_generation, 2)
 
-    def get_history_best_result(self) -> TrialState | None:
-        return self.history_best
+    # def get_history_best_result(self) -> TrialState | None:
+    #     return self.history_best
 
     def get_nlargest_iteration_trials(self, k: int) -> list[TrialState]:
         return heapq.nlargest(
@@ -342,23 +417,43 @@ class TrialManager:
             key=lambda t: t.accuracy,
         )
 
+    @synchronized
     def has_pending_trials(self) -> bool:
         return bool(self.pending_ids)
+
+    @synchronized
+    def get_pending_ids(self) -> list[int]:
+        return list(self.pending_ids)
+
+    @synchronized
+    def get_running_ids(self) -> list[int]:
+        return list(self.running_ids)
+
+    @synchronized
+    def get_waiting_ids(self) -> list[int]:
+        return list(self.waiting_ids)
+
+    @synchronized
+    def get_completed_ids(self) -> list[int]:
+        return list(self.completed_ids)
+
+    @synchronized
+    def get_failed_ids(self) -> list[int]:
+        return list(self.failed_ids)
 
     def maybe_update_mutation_baseline(self) -> None:
         self._mutation_baseline = self.get_mutation_baseline()
         self._upper_quantile_trials = self.get_upper_quantile_trials()
 
+    @synchronized
     def update_trial(self, trial_id: int, partial: PartialTrialState) -> None:
         trial_state = self._get_trial_or_raise(trial_id)
 
         old_checkpoint_location = trial_state.last_checkpoint_location
-
         trial_state.update_partial(partial)
-
         if (
             not old_checkpoint_location.is_empty()
-            and old_checkpoint_location.worker_id
+            and old_checkpoint_location.worker_id is not None
             and trial_state.last_checkpoint_location.worker_id
             != old_checkpoint_location.worker_id
         ):
@@ -377,28 +472,34 @@ class TrialManager:
 
         if "accuracy" in partial:
             if trial_state.accuracy > 0 and (
-                self.history_best is None
-                or trial_state.accuracy > self.history_best.accuracy
+                trial_state.accuracy > self.history_best["accuracy"]
             ):
-                self.history_best = trial_state
+                self.history_best["accuracy"] = trial_state.accuracy
+                self.history_best["checkpoint"] = trial_state.checkpoint
+                self.history_best["hyperparameter"] = trial_state.hyperparameter
+                self.history_best["generation"] = trial_state.generation
 
             if self.history_best:
                 self.logger.info(
                     "History best accuracy: %f, %s, iteration: %d",
-                    self.history_best.accuracy,
-                    str(self.history_best.hyperparameter),
-                    self.history_best.generation,
+                    self.history_best["accuracy"],
+                    str(self.history_best["hyperparameter"]),
+                    self.history_best["generation"],
                 )
+
             self.maybe_update_mutation_baseline()
-        self.display_trial_result()
+
+        self._display_event.set()
 
     def is_finish(self) -> bool:
+        total_finished = len(self.completed_ids) + len(self.failed_ids)
         self.logger.info(
-            "已完成 Trial 數(%2d/%2d)",
+            "已完成 Trial 數(%2d/%2d), 失敗數(%2d)",
             len(self.completed_ids),
             len(self.all_trials),
+            len(self.failed_ids),
         )
-        return len(self.completed_ids) >= len(self.all_trials)
+        return total_finished >= len(self.all_trials)
 
     def get_log_file(self) -> str:
         """
@@ -427,7 +528,7 @@ class TrialManager:
 
         return {
             "hyperparameter": hyperparameter,
-            "checkpoint": chose_trial.checkpoint,
+            "checkpoint": chose_trial.checkpoint.copy(),
         }
 
     def _worker_type_to_str(self, worker_type: WorkerType | None) -> str:
@@ -471,6 +572,17 @@ class TrialManager:
     def _worker_ip_to_str(self, worker_id: int) -> str:
         return self.worker_states[worker_id].node_name.split(".")[-1]
 
+    def _display_loop(self) -> None:
+        while True:
+            self._display_event.wait()
+            self._display_event.clear()
+
+            if self._stop_display:
+                break
+
+            time.sleep(0.1)
+            self.display_trial_result()
+
     def display_trial_result(
         self,
         output_path: Path = TRIAL_PROGRESS_OUTPUT_PATH,
@@ -513,8 +625,6 @@ class TrialManager:
                     )
 
                     h = i.hyperparameter
-                    model_name = getattr(h, "model_name", "-")
-                    momentum = getattr(h, "momentum", 0.0)
 
                     hyperparam_str = str(h)
 
@@ -531,14 +641,16 @@ class TrialManager:
                     ]
                     f.write(
                         "┃"
-                        + "┃".join(val.rjust(w) for val, w in zip(row, widths))
-                        + "┃\n"
+                        + "┃".join(
+                            val.rjust(w) for val, w in zip(row, widths, strict=True)
+                        )
+                        + "┃\n",
                     )
 
                 # 底線
                 f.write("┗" + "┻".join("━" * w for w in widths) + "┛\n")
                 timestamp = (datetime.now(UTC) + timedelta(hours=8)).strftime(
-                    "%Y-%m-%d %H:%M:%S"
+                    "%Y-%m-%d %H:%M:%S",
                 )
                 f.write(f"{timestamp}\n")
 
@@ -571,3 +683,8 @@ class TrialManager:
                 40,
             ),
         )
+
+    def close(self) -> None:
+        self._stop_display = True
+        self._display_event.set()
+        self._display_thread.join()

@@ -1,16 +1,16 @@
 import unittest
 
 from src.trial_state import Hyperparameter, TrialState
-from src.utils import ModelType
+from src.utils import ModelType, Checkpoint
 
 
 class TestTrialState(unittest.TestCase):
     def test_trial_state_without_checkpoint(self) -> None:
         trial = TrialState(
-            0,
-            Hyperparameter(0.1, 0.2, 128, ModelType.RESNET_18),
-            None,
-            1000,
+            id=0,
+            hyperparameter=Hyperparameter(0.1, 128),
+            checkpoint=Checkpoint.empty(),
+            generation=0,
         )
 
         assert trial.checkpoint.is_empty(), "Trial checkpoint is not None"
