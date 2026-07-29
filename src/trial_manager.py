@@ -11,6 +11,7 @@ import ray
 from ray.actor import ActorHandle
 
 from .config import (
+    ENABLE_CHECKPOINT_LOCALITY,
     TRIAL_PROGRESS_OUTPUT_PATH,
 )
 from .trial_state import PartialTrialState, TrialState
@@ -271,7 +272,8 @@ class TrialManager:
         potential_trials = [
             t
             for t in trials
-            if not t.last_checkpoint_location.is_empty()
+            if ENABLE_CHECKPOINT_LOCALITY
+            and not t.last_checkpoint_location.is_empty()
             and t.last_checkpoint_location.worker_id == worker_id
         ]
 
@@ -362,7 +364,7 @@ class TrialManager:
         )
         length = (len(generations) // 4) + 1
         target_generation = sum(generations[:length]) // length - generation + 1
-        return max(target_generation, 1)
+        return max(target_generation, 2)
 
     # def get_history_best_result(self) -> TrialState | None:
     #     return self.history_best
@@ -451,7 +453,7 @@ class TrialManager:
         trial_state.update_partial(partial)
         if (
             not old_checkpoint_location.is_empty()
-            and old_checkpoint_location.worker_id
+            and old_checkpoint_location.worker_id is not None
             and trial_state.last_checkpoint_location.worker_id
             != old_checkpoint_location.worker_id
         ):

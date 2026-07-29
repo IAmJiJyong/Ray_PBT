@@ -10,6 +10,7 @@ from torch import nn, optim
 from torch.utils.data import DataLoader
 
 from .config import (
+    ENABLE_CHECKPOINT_LOCALITY,
     ITERATION_PER_GENERATION,
 )
 from .task_strategy import TaskStrategy
@@ -146,6 +147,8 @@ class Worker:
         self.interrupt_set.add(trial_id)
 
     def save_checkpoint(self, trial_state: TrialState) -> None:
+        if not ENABLE_CHECKPOINT_LOCALITY:
+            return
         self.log("info", "儲存 Checkpoint", trial_id=trial_state.id)
         if trial_state.checkpoint.is_empty():
             self.log("warning", "Checkpoint 為空", trial_id=trial_state.id)
@@ -160,6 +163,8 @@ class Worker:
         Args:
             trial_id (int): 試驗 ID。
         """
+        if not ENABLE_CHECKPOINT_LOCALITY:
+            return Checkpoint.empty()
         self.log("info", "取得 Checkpoint", trial_id=trial_id)
         return self.saved_checkpoint.get(trial_id, Checkpoint.empty())
 
@@ -170,6 +175,8 @@ class Worker:
         Args:
             trial_id (int): 試驗 ID。
         """
+        if not ENABLE_CHECKPOINT_LOCALITY:
+            return Checkpoint.empty()
         self.log("info", "取得並移除 Checkpoint", trial_id=trial_id)
         return self.saved_checkpoint.pop(trial_id, Checkpoint.empty())
 
@@ -180,6 +187,8 @@ class Worker:
         Args:
             trial_id (int): 試驗 ID。
         """
+        if not ENABLE_CHECKPOINT_LOCALITY:
+            return
         if trial_id in self.saved_checkpoint:
             self.saved_checkpoint.pop(trial_id)
             self.log("info", f"已移除 Trial {trial_id} 的檢查點", trial_id=trial_id)

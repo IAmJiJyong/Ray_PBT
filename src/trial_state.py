@@ -7,6 +7,7 @@ import torch
 from torch import nn, optim
 
 from .config import (
+    ENABLE_CHECKPOINT_LOCALITY,
     MAX_GENERATION,
     STOP_ACCURACY,
 )
@@ -88,10 +89,13 @@ class TrialState:
     def update_worker_state(self, worker_state: WorkerState) -> None:
         self.worker_type = worker_state.worker_type
         self.worker_id = worker_state.id
-        self.last_checkpoint_location = CheckpointLocation(
-            worker_state.id,
-            ray.get_runtime_context().current_actor,
-        )
+        if ENABLE_CHECKPOINT_LOCALITY:
+            self.last_checkpoint_location = CheckpointLocation(
+                worker_state.id,
+                ray.get_runtime_context().current_actor,
+            )
+        else:
+            self.last_checkpoint_location = CheckpointLocation.empty()
 
     def update_checkpoint(self, model: nn.Module, optimizer: optim.Optimizer) -> None:
         self.checkpoint.model_state_dict = model.cpu().state_dict()

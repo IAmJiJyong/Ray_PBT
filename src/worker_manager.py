@@ -8,7 +8,7 @@ from threading import RLock
 import ray
 from ray.actor import ActorHandle
 
-from src.config import CPU_TRIALS_LIMIT, GPU_TRIALS_LIMIT
+from src.config import CPU_TRIALS_LIMIT, ENABLE_CHECKPOINT_LOCALITY, GPU_TRIALS_LIMIT
 
 from .task_strategy import TaskStrategy
 from .trial_state import TrialState
@@ -157,7 +157,10 @@ class WorkerManager:
                 msg = f"Worker {worker_id} 不存在."
                 raise ValueError(msg)
 
-            if trial.last_checkpoint_location.worker_id == worker_id:
+            if (
+                ENABLE_CHECKPOINT_LOCALITY
+                and trial.last_checkpoint_location.worker_id == worker_id
+            ):
                 self.logger.info(
                     "分配 Trial %d snapshot 到 Worker %d",
                     trial.id,
@@ -251,18 +254,7 @@ def generate_all_worker_states() -> list[WorkerState]:
 
             if "GPU" in resource:
                 cpus -= gpus
-                worker_states.append(
-                    WorkerState(
-                        id=next(count_gen),
-                        num_cpus=1,
-                        num_gpus=1,
-                        node_name=f"node:{node_address}",
-                        max_trials=GPU_TRIALS_LIMIT,
-                        worker_type=WorkerType.GPU,
-                    ),
-                )
-
-                # worker_states.extend(
+                # worker_states.append(
                 #     WorkerState(
                 #         id=next(count_gen),
                 #         num_cpus=1,
@@ -270,9 +262,20 @@ def generate_all_worker_states() -> list[WorkerState]:
                 #         node_name=f"node:{node_address}",
                 #         max_trials=GPU_TRIALS_LIMIT,
                 #         worker_type=WorkerType.GPU,
-                #     )
-                #     for _ in range(gpus)
+                #     ),
                 # )
+
+                worker_states.extend(
+                    WorkerState(
+                        id=next(count_gen),
+                        num_cpus=1,
+                        num_gpus=1,
+                        node_name=f"node:{node_address}",
+                        max_trials=GPU_TRIALS_LIMIT,
+                        worker_type=WorkerType.GPU,
+                    )
+                    for _ in range(gpus)
+                )
 
             if "CPU" in resource:
                 if node_address == head_node_address:

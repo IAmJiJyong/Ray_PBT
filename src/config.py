@@ -20,3 +20,4 @@ TRIAL_PROGRESS_OUTPUT_PATH: Path = Path(
 ).expanduser()
 GPU_TRIALS_LIMIT: int = config.get("gpu_trials_limit", 2)
 CPU_TRIALS_LIMIT: int = config.get("cpu_trials_limit", 1)
+ENABLE_CHECKPOINT_LOCALITY: bool = config.get("enable_checkpoint_locality", True)
