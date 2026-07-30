@@ -139,20 +139,6 @@ tuner = Tuner.remote(
     ResNet18Cifar10Task(),
     Path(f"./runs/ResNet18_CIFAR10/Trial{trial_num}/{timestamp}").resolve(),
 )
-
-使用 ResNet-50 訓練 CIFAR-100：
-Python
-
-from src.hyperparameter import CNNHyperparameter
-from src.task_strategy import ResNet50CIFAR100Task
-
-trial_states = generate_trial_states(CNNHyperparameter, trial_num)
-
-tuner = Tuner.remote(
-    trial_states,
-    ResNet50CIFAR100Task(),
-    Path(f"./runs/ResNet50_CIFAR100/Trial{trial_num}/{timestamp}").resolve(),
-)
 ```
 
 ### 使用 ResNet-50 訓練 CIFAR-100
