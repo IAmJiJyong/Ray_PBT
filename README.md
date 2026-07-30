@@ -1,6 +1,6 @@
-# Ray-based Population-Based Training (PBT) 系統
+# 基於快取區域性感知的PBT系統
 
-本專案是一個基於 [Ray](https://docs.ray.io/) 構建的高效能分散式**基於群體訓練（Population-Based Training, PBT）**超參數優化框架。系統支援異質運算資源（CPU / GPU 混合）的動態任務調度、工作偷取（Work-Stealing）策略、檢查點區域性（Checkpoint Locality）優化，以及實時訓練指標與日誌監控。
+本專案是一個使用 [Ray](https://docs.ray.io/) 構建的高效能分散式 **基於群體訓練（Population-Based Training, PBT）** 超參數優化框架。系統支援異質運算資源（CPU / GPU 混合）的動態任務調度、工作偷取（Work-Stealing）策略、檢查點區域性（Checkpoint Locality）優化，以及實時訓練指標與日誌監控。
 
 ---
 
